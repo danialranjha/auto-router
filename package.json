@@ -1,0 +1,46 @@
+{
+  "name": "pi-auto-router",
+  "version": "0.1.0",
+  "description": "Subscription-first automatic model/provider failover router for pi coding agent",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "extension",
+    "model",
+    "router",
+    "failover",
+    "llm"
+  ],
+  "type": "module",
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "auto-router.routes.example.json"
+  ],
+  "scripts": {
+    "clean": "echo 'nothing to clean'",
+    "build": "echo 'nothing to build'",
+    "check": "echo 'nothing to check'"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/danialranjha/pi-auto-router.git"
+  },
+  "bugs": {
+    "url": "https://github.com/danialranjha/pi-auto-router/issues"
+  },
+  "homepage": "https://github.com/danialranjha/pi-auto-router#readme"
+}
