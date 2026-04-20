@@ -253,7 +253,8 @@ function isRetryableError(message: string): boolean {
     "temporarily unavailable", "timeout", "timed out", "econnreset", "etimedout", "network", "connection",
     "try again", "internal server error", "502", "503", "504",
     "quota", "credit", "balance", "billing", "exhausted", "reached", "limit",
-    "bad gateway", "service unavailable", "gateway timeout", "500", "busy", "upstream"
+    "bad gateway", "service unavailable", "gateway timeout", "500", "busy", "upstream",
+    "hit your limit", "quota exceeded", "credits exhausted", "insufficient balance"
   ].some((needle) => text.includes(needle));
 }
 
@@ -339,13 +340,24 @@ async function tryTarget(
   };
 
   const inner = streamSimple(innerModel, context, { ...options, apiKey: token });
+  let lastMessage: AssistantMessage | undefined;
 
   for await (const event of inner) {
+    if (event.type === "done") {
+      lastMessage = event.message;
+    }
+
     const isRealContent = [
       "text_start", "text_delta", "toolcall_start", "toolcall_delta", "toolcall_end"
     ].includes(event.type);
 
     if (isRealContent) {
+      if (event.type === "text_delta") {
+        if (isRetryableError(event.text)) {
+          putOnCooldown(target, event.text);
+          return { success: false, retryableFailure: `${target.label}: ${event.text}` };
+        }
+      }
       sawSubstantive = true;
     } else if (event.type === "thinking_delta") {
       thinkingCount++;
@@ -391,6 +403,24 @@ async function tryTarget(
   }
 
   lastAttemptByRoute.set(outerModel.id, target.label);
+
+  if (lastMessage?.stopReason === "error" || lastMessage?.errorMessage) {
+    const message = lastMessage.errorMessage || "Unknown terminal error";
+    if (!sawSubstantive && isRetryableError(message)) {
+      putOnCooldown(target, message);
+      return { success: false, retryableFailure: `${target.label}: ${message}` };
+    }
+    return {
+      success: false,
+      terminalError: {
+        ...lastMessage,
+        provider: outerModel.provider,
+        model: outerModel.id,
+        errorMessage: `${target.label}: ${message}`
+      }
+    };
+  }
+
   return { success: true };
 }
 
