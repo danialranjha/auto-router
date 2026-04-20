@@ -251,7 +251,9 @@ function isRetryableError(message: string): boolean {
   return [
     "429", "rate limit", "ratelimit", "too many requests", "overloaded", "overload", "capacity",
     "temporarily unavailable", "timeout", "timed out", "econnreset", "etimedout", "network", "connection",
-    "try again", "internal server error", "502", "503", "504"
+    "try again", "internal server error", "502", "503", "504",
+    "quota", "credit", "balance", "billing", "exhausted", "reached", "limit",
+    "bad gateway", "service unavailable", "gateway timeout", "500", "busy", "upstream"
   ].some((needle) => text.includes(needle));
 }
 
@@ -327,6 +329,7 @@ async function tryTarget(
   const buffered: any[] = [];
   let flushed = false;
   let sawSubstantive = false;
+  let thinkingCount = 0;
 
   const flush = () => {
     if (flushed) return;
@@ -338,11 +341,19 @@ async function tryTarget(
   const inner = streamSimple(innerModel, context, { ...options, apiKey: token });
 
   for await (const event of inner) {
-    const isSubstantive = [
-      "text_start", "text_delta", "thinking_start", "thinking_delta", "toolcall_start", "toolcall_delta", "toolcall_end"
+    const isRealContent = [
+      "text_start", "text_delta", "toolcall_start", "toolcall_delta", "toolcall_end"
     ].includes(event.type);
 
-    if (isSubstantive) sawSubstantive = true;
+    if (isRealContent) {
+      sawSubstantive = true;
+    } else if (event.type === "thinking_delta") {
+      thinkingCount++;
+      if (thinkingCount > 10) sawSubstantive = true;
+    } else if (event.type === "thinking_start") {
+      // thinking_start is not immediately substantive to allow failover
+      // if the model fails right after starting to think.
+    }
 
     if (event.type === "error") {
       const message = event.error.errorMessage || `${target.label}: unknown error`;
