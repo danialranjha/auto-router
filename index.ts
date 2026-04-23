@@ -229,12 +229,22 @@ function loadRoutesConfig(): void {
   }
 }
 
+function normalizeModelToken(value: string): string {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "")
+    .trim();
+}
+
 function resolveModelFromRegistry(target: RouteTarget, context?: Context): Model<Api> | undefined {
   const registry = (context as any)?.modelRegistry;
   const available = typeof registry?.getAvailable === "function" ? registry.getAvailable() : [];
   const provider = target.provider === "claude-agent-sdk" ? "anthropic" : target.provider;
   const requestedId = String(target.modelId ?? "").toLowerCase();
-  const requestedTail = requestedId.split("/").filter(Boolean).pop() ?? requestedId;
+  const requestedParts = requestedId.split("/").filter(Boolean);
+  const requestedTail = requestedParts.at(-1) ?? requestedId;
+  const requestedNormalized = normalizeModelToken(requestedId);
+  const requestedTailNormalized = normalizeModelToken(requestedTail);
 
   const wrapClaude = (base: any): Model<Api> => ({
     ...base,
@@ -257,11 +267,14 @@ function resolveModelFromRegistry(target: RouteTarget, context?: Context): Model
   const matches = available.filter((model: any) => String(model?.provider ?? "").toLowerCase() === provider.toLowerCase());
   const pick = matches.find((model: any) => {
     const id = String(model?.id ?? "").toLowerCase();
-    return id === requestedId || id === requestedTail || id.endsWith(`/${requestedId}`) || id.endsWith(`/${requestedTail}`);
-  }) ?? available.find((model: any) => {
+    const idNormalized = normalizeModelToken(id);
+    return id === requestedId || id === requestedTail || id.endsWith(`/${requestedId}`) || id.endsWith(`/${requestedTail}`) || idNormalized === requestedNormalized || idNormalized === requestedTailNormalized;
+  }) ?? matches.find((model: any) => {
     const id = String(model?.id ?? "").toLowerCase();
     const name = String(model?.name ?? "").toLowerCase();
-    return String(model?.provider ?? "").toLowerCase() === provider.toLowerCase() && (name.includes(requestedTail) || id.includes(requestedTail));
+    const idNormalized = normalizeModelToken(id);
+    const nameNormalized = normalizeModelToken(name);
+    return id.includes(requestedTail) || name.includes(requestedTail) || idNormalized.includes(requestedTailNormalized) || requestedNormalized.includes(idNormalized) || nameNormalized.includes(requestedTailNormalized);
   });
 
   if (!pick) return undefined;
