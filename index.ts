@@ -29,6 +29,8 @@ type RouteDefinition = {
   name?: string;
   reasoning?: boolean;
   input?: ("text" | "image")[];
+  contextWindow?: number;
+  maxTokens?: number;
   targets: RouteTarget[];
 };
 
@@ -194,6 +196,8 @@ function loadRoutesConfig(): void {
         name: typeof routeDef.name === "string" ? routeDef.name : routeId,
         reasoning: typeof routeDef.reasoning === "boolean" ? routeDef.reasoning : true,
         input: Array.isArray(routeDef.input) ? routeDef.input.filter((x): x is "text" | "image" => x === "text" || x === "image") : ["text", "image"],
+        contextWindow: typeof routeDef.contextWindow === "number" ? routeDef.contextWindow : undefined,
+        maxTokens: typeof routeDef.maxTokens === "number" ? routeDef.maxTokens : undefined,
         targets: targets.map((target) => ({ ...target })),
       };
     }
@@ -232,12 +236,13 @@ function loadRoutesConfig(): void {
 function normalizeModelToken(value: string): string {
   return String(value ?? "")
     .toLowerCase()
+    .replace(/:(cloud|latest|instruct)$/i, "")
     .replace(/[^a-z0-9]+/g, "")
     .trim();
 }
 
 function resolveModelFromRegistry(target: RouteTarget, context?: Context): Model<Api> | undefined {
-  const registry = (context as any)?.modelRegistry;
+  const registry = (context as any)?.modelRegistry || latestUiContext?.modelRegistry;
   const available = typeof registry?.getAvailable === "function" ? registry.getAvailable() : [];
   const provider = target.provider === "claude-agent-sdk" ? "anthropic" : target.provider;
   const requestedId = String(target.modelId ?? "").toLowerCase();
@@ -253,6 +258,11 @@ function resolveModelFromRegistry(target: RouteTarget, context?: Context): Model
     baseUrl: "claude-agent-sdk",
   } as Model<Api>);
 
+  const wrapTarget = (base: any): Model<Api> => {
+    if (target.provider === "claude-agent-sdk") return wrapClaude(base);
+    return base as Model<Api>;
+  };
+
   const direct = (() => {
     try {
       return getModel(provider, target.modelId);
@@ -260,35 +270,48 @@ function resolveModelFromRegistry(target: RouteTarget, context?: Context): Model
       return undefined;
     }
   })();
-  if (direct) return target.provider === "claude-agent-sdk" ? wrapClaude(direct) : (direct as Model<Api>);
+  if (direct) return wrapTarget(direct);
 
   if (!Array.isArray(available) || available.length === 0) return undefined;
 
-  const matches = available.filter((model: any) => String(model?.provider ?? "").toLowerCase() === provider.toLowerCase());
-  const pick = matches.find((model: any) => {
-    const id = String(model?.id ?? "").toLowerCase();
-    const idNormalized = normalizeModelToken(id);
-    return id === requestedId || id === requestedTail || id.endsWith(`/${requestedId}`) || id.endsWith(`/${requestedTail}`) || idNormalized === requestedNormalized || idNormalized === requestedTailNormalized;
-  }) ?? matches.find((model: any) => {
-    const id = String(model?.id ?? "").toLowerCase();
-    const name = String(model?.name ?? "").toLowerCase();
-    const idNormalized = normalizeModelToken(id);
-    const nameNormalized = normalizeModelToken(name);
-    return id.includes(requestedTail) || name.includes(requestedTail) || idNormalized.includes(requestedTailNormalized) || requestedNormalized.includes(idNormalized) || nameNormalized.includes(requestedTailNormalized);
-  });
+  const findInList = (list: any[]) => {
+    return list.find((model: any) => {
+      const id = String(model?.id ?? "").toLowerCase();
+      const idNormalized = normalizeModelToken(id);
+      return id === requestedId || id === requestedTail || id.endsWith(`/${requestedId}`) || id.endsWith(`/${requestedTail}`) || idNormalized === requestedNormalized || idNormalized === requestedTailNormalized;
+    }) ?? list.find((model: any) => {
+      const id = String(model?.id ?? "").toLowerCase();
+      const name = String(model?.name ?? "").toLowerCase();
+      const idNormalized = normalizeModelToken(id);
+      const nameNormalized = normalizeModelToken(name);
+      return id.includes(requestedTail) || name.includes(requestedTail) || idNormalized.includes(requestedTailNormalized) || requestedNormalized.includes(idNormalized) || nameNormalized.includes(requestedTailNormalized);
+    });
+  };
 
-  if (!pick) return undefined;
+  const providerMatches = available.filter((model: any) => String(model?.provider ?? "").toLowerCase() === provider.toLowerCase());
+  const pick = findInList(providerMatches);
+  if (pick) return wrapTarget(pick);
 
-  return target.provider === "claude-agent-sdk" ? wrapClaude(pick) : (pick as Model<Api>);
+  // Fallback: search across all providers if not found in requested provider
+  const globalPick = findInList(available);
+  if (globalPick) return wrapTarget(globalPick);
+
+  return undefined;
 }
 
 function getInnerModel(target: RouteTarget, context?: Context): Model<Api> {
   const model = resolveModelFromRegistry(target, context);
-  if (!model) throw new Error(`Configured route target not found: ${target.provider}/${target.modelId}`);
+  if (!model) {
+    const registry = (context as any)?.modelRegistry;
+    const available = typeof registry?.getAvailable === "function" ? registry.getAvailable() : [];
+    const providers = Array.from(new Set(available.map((m: any) => m.provider))).join(", ");
+    throw new Error(`Configured route target not found: ${target.provider}/${target.modelId}. Available providers: ${providers || "none"}`);
+  }
   return model;
 }
 
 function getPrimaryModelLimits(route: RouteDefinition): { contextWindow: number; maxTokens: number } {
+  if (route.contextWindow && route.maxTokens) return { contextWindow: route.contextWindow, maxTokens: route.maxTokens };
   const first = route.targets[0];
   if (!first) return { contextWindow: 200000, maxTokens: 128000 };
   try {
@@ -595,14 +618,14 @@ function routeSummary(routeId: string): string {
     if (!target) return `${index + 1}. [Invalid Target]`;
     const key = getTargetKey(target);
     const cooldown = cooldowns.get(key);
-    const cooldownText = cooldown && cooldown.until > Date.now() ? ` | cooldown ${formatRemainingMs(cooldown.until - Date.now())}` : "";
+    const cooldownText = cooldown && cooldown.until > Date.now() ? ` | cooldown ${formatRemainingMs(cooldown.until - Date.now())} (Reason: ${cooldown.reason})` : "";
     const authText = target.authProvider ? `auth=${target.authProvider}` : "auth=builtin";
     const healthText = healthySet.has(key) ? "healthy" : "unavailable";
     return `${index + 1}. ${target.label || "Unknown"} [${target.provider || "unknown"}/${target.modelId || "unknown"}] | ${authText} | ${healthText}${cooldownText}`;
   });
   return [
     `${routeId} — ${prettyRouteName(routeId)}`,
-    (() => { const l = getPrimaryModelLimits(route); return `thinking=${route.reasoning !== false} | input=${(route.input ?? ["text", "image"]).join(",")} | ctx=${l.contextWindow} | max=${l.maxTokens} (from primary target)`; })(),
+    (() => { const l = getPrimaryModelLimits(route); return `thinking=${route.reasoning !== false} | vision=${(route.input ?? ["text", "image"]).includes("image")} | ctx=${l.contextWindow.toLocaleString()} | max=${l.maxTokens.toLocaleString()}${route.contextWindow ? " (forced)" : ""}`; })(),
     ...lines
   ].join("\n");
 }
@@ -846,6 +869,34 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
+      if (subcommand === "debug") {
+        const available = ctx.modelRegistry.getAvailable();
+        const providers = Array.from(new Set(available.map((m: any) => m.provider)));
+        ctx.ui.notify(`Available Providers: ${providers.join(", ")}\n\nFirst 20 Models:\n${available.slice(0, 20).map((m: any) => `${m.provider}/${m.id}`).join("\n")}`, "info");
+        return;
+      }
+
+      if (subcommand === "test-resolve") {
+        if (!remainder) {
+          ctx.ui.notify("Usage: /auto-router test-resolve <provider>/<modelId>", "error");
+          return;
+        }
+        const spec = parseModelSpec(remainder);
+        if (!spec) {
+          ctx.ui.notify("Invalid spec. Use provider/modelId", "error");
+          return;
+        }
+        const res = resolveModelFromRegistry({ provider: spec.provider, modelId: spec.modelId, label: "Test" }, ctx);
+        if (res) {
+          ctx.ui.notify(`✅ Resolved ${spec.provider}/${spec.modelId}\nTarget: ${res.provider}/${res.id}\nName: ${res.name}`, "success");
+        } else {
+          const available = ctx.modelRegistry.getAvailable();
+          const providers = Array.from(new Set(available.map((m: any) => m.provider))).join(", ");
+          ctx.ui.notify(`❌ Failed to resolve ${spec.provider}/${spec.modelId}\nAvailable providers: ${providers || "none"}`, "error");
+        }
+        return;
+      }
+
       ctx.ui.notify([
         `Active route: ${activeRouteId ?? "none"}`,
         activeRouteId ? getStatusLine(activeRouteId) : "Select an auto-router model via /model to use it.",
@@ -860,6 +911,8 @@ export default function (pi: ExtensionAPI) {
         "/auto-router aliases",
         "/auto-router resolve <alias>",
         "/auto-router models",
+        "/auto-router test-resolve <provider/modelId>",
+        "/auto-router debug",
         "/auto-router reload",
         "/auto-router reset"
       ].join("\n"), "info");

@@ -1,2 +1,5 @@
 node_modules/
+dist/
+check-models.ts
+test-logic.js
 .DS_Store
