@@ -261,21 +261,48 @@ function isRetryableError(message: any): boolean {
     "429", "rate limit", "ratelimit", "too many requests", "overloaded", "overload", "capacity",
     "temporarily unavailable", "timeout", "timed out", "econnreset", "etimedout", "network", "connection",
     "try again", "internal server error", "502", "503", "504",
-    "quota", "credit", "balance", "billing", "exhausted", "reached", "limit",
-    "bad gateway", "service unavailable", "gateway timeout", "500", "busy", "upstream",
+    "quota", "quota will reset", "credit", "balance", "billing", "exhausted", "exhausted your capacity",
+    "reached", "limit", "bad gateway", "service unavailable", "gateway timeout", "500", "busy", "upstream",
     "hit your limit", "quota exceeded", "credits exhausted", "insufficient balance"
   ].some((needle) => text.includes(needle));
 }
 
+function parseResetAfterMs(message: any): number | undefined {
+  const text = String(message ?? "");
+  const match = text.match(/reset after\s+(\d+)\s*([smhd])/i);
+  if (!match) return undefined;
+  const value = Number(match[1]);
+  const unit = match[2].toLowerCase();
+  if (!Number.isFinite(value) || value <= 0) return undefined;
+  const unitMs = unit === "s"
+    ? 1_000
+    : unit === "m"
+      ? 60_000
+      : unit === "h"
+        ? 60 * 60_000
+        : 24 * 60 * 60_000;
+  return value * unitMs;
+}
+
 function getCooldownMs(message: any): number {
+  const explicitResetMs = parseResetAfterMs(message);
+  if (explicitResetMs) return explicitResetMs + 5_000;
+
   const text = String(message ?? "").toLowerCase();
   if (text.includes("429") || text.includes("rate limit") || text.includes("too many requests")) return 2 * 60_000;
-  if (text.includes("overloaded") || text.includes("capacity") || text.includes("503")) return 5 * 60_000;
+  if (text.includes("quota") || text.includes("capacity") || text.includes("overloaded") || text.includes("503")) return 5 * 60_000;
   return 90_000;
 }
 
 function putOnCooldown(target: RouteTarget, reason: string) {
   cooldowns.set(getTargetKey(target), { until: Date.now() + getCooldownMs(reason), reason });
+}
+
+function formatRemainingMs(ms: number): string {
+  if (ms < 60_000) return `${Math.max(1, Math.ceil(ms / 1_000))}s`;
+  if (ms < 60 * 60_000) return `${Math.max(1, Math.ceil(ms / 60_000))}m`;
+  if (ms < 24 * 60 * 60_000) return `${Math.max(1, Math.ceil(ms / (60 * 60_000)))}h`;
+  return `${Math.max(1, Math.ceil(ms / (24 * 60 * 60_000)))}d`;
 }
 
 function getHealthyTargets(routeId: string): RouteTarget[] {
@@ -296,8 +323,7 @@ function formatCooldowns(routeId?: string): string {
     .map((target) => {
       const state = cooldowns.get(getTargetKey(target));
       if (!state || state.until <= now) return null;
-      const mins = Math.max(1, Math.ceil((state.until - now) / 60_000));
-      return `${target.label}: cooldown ${mins}m`;
+      return `${target.label}: cooldown ${formatRemainingMs(state.until - now)}`;
     })
     .filter((x): x is string => Boolean(x));
   return lines.length ? lines.join(" | ") : "no cooldowns";
@@ -516,7 +542,7 @@ function routeSummary(routeId: string): string {
     if (!target) return `${index + 1}. [Invalid Target]`;
     const key = getTargetKey(target);
     const cooldown = cooldowns.get(key);
-    const cooldownText = cooldown && cooldown.until > Date.now() ? ` | cooldown ${Math.max(1, Math.ceil((cooldown.until - Date.now()) / 60_000))}m` : "";
+    const cooldownText = cooldown && cooldown.until > Date.now() ? ` | cooldown ${formatRemainingMs(cooldown.until - Date.now())}` : "";
     const authText = target.authProvider ? `auth=${target.authProvider}` : "auth=builtin";
     const healthText = healthySet.has(key) ? "healthy" : "unavailable";
     return `${index + 1}. ${target.label || "Unknown"} [${target.provider || "unknown"}/${target.modelId || "unknown"}] | ${authText} | ${healthText}${cooldownText}`;
