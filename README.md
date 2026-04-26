@@ -16,7 +16,10 @@ Unlike a simple model switcher, `auto-router` can retry the **same request** acr
 - **Same-request failover** before substantive output starts
 - **Cooldown tracking** for temporarily failing providers/models
 - **External JSON config** for route definitions and aliases
-- **Richer operator commands** for status, route inspection, search, aliases, and reloads
+- **Intelligent routing policy engine** — context analysis, `@` shortcuts, capability/constraint solving
+- **Per-provider budget tracking** with daily limits, persistent stats, and audit-driven failover
+- **Routing decision explainer** so you can see why a target was selected
+- **Richer operator commands** for status, route inspection, search, aliases, reloads, budgets, and explanations
 
 ## Install
 
@@ -163,8 +166,11 @@ Skip it for providers that authenticate internally or don’t require pi-managed
 - `/auto-router aliases`
 - `/auto-router resolve <alias>`
 - `/auto-router models`
+- `/auto-router explain [routeId]` — show the last routing decision (tier, target, confidence, reasoning)
+- `/auto-router shortcuts` — list available `@` shortcuts
+- `/auto-router budget [show|set <provider> <usd>|clear <provider>]` — view/manage daily per-provider budgets
 - `/auto-router reload`
-- `/auto-router reset`
+- `/auto-router reset` — clears cooldowns, decision history, and budget warnings
 
 ### Example operator flows
 
@@ -177,8 +183,70 @@ Skip it for providers that authenticate internally or don’t require pi-managed
 /auto-router search gemini
 /auto-router aliases
 /auto-router resolve premium
+/auto-router explain
+/auto-router shortcuts
+/auto-router budget show
+/auto-router budget set google-antigravity 5.00
 /auto-router reload
 ```
+
+## `@` shortcuts
+
+Prefix any prompt with one of these tokens to bias routing toward a specific tier. The shortcut is parsed off the front of the prompt (so the model never sees it) and translated into capability requirements before constraint solving:
+
+| Shortcut      | Tier        | Effect                                                              |
+| ------------- | ----------- | ------------------------------------------------------------------- |
+| `@reasoning`  | `reasoning` | Requires reasoning-capable models                                   |
+| `@swe`        | `swe`       | Requires reasoning-capable models (software-engineering oriented)   |
+| `@long`       | `long`      | Requires `contextWindow ≥ max(estimatedTokens, 100k)`               |
+| `@vision`     | `vision`    | Requires multimodal/vision-capable models                           |
+| `@fast`       | `fast`      | Hint only — currently does not constrain candidates                 |
+
+Example:
+
+```text
+@vision describe what's in this screenshot
+@long summarize this 80-page document …
+@reasoning prove that there are infinitely many primes
+```
+
+Use `/auto-router explain` after a request to see how the shortcut influenced the decision.
+
+## Budgets
+
+`auto-router` tracks daily input/output tokens and estimated cost per provider, persisted at:
+
+```text
+~/.pi/agent/extensions/auto-router.stats.json
+```
+
+When you set a daily limit, the budget auditor runs before each request:
+
+- **≥ 80% of limit** → soft warning (surfaces in routing reasoning and the status line)
+- **≥ 100% of limit** → that provider is excluded from the candidate set; routing falls back to the next allowed target
+- If **all** candidates are over budget, routing falls back to the healthy list (so you’re never fully blocked) but the reasoning records the budget event
+
+Manage budgets with:
+
+```text
+/auto-router budget show
+/auto-router budget set claude-agent-sdk 10.00
+/auto-router budget set google-antigravity 5.00
+/auto-router budget clear openai-codex
+```
+
+The selected target’s remaining daily budget is reported in `decision.metadata.budgetRemaining` and visible via `/auto-router explain`.
+
+## Status line
+
+The status line surfaces routing state at a glance:
+
+```text
+auto-router Subscription Premium Router | tier=reasoning (0.90) | current: Claude Opus 4.6 | healthy: …, … | ⚠ google-antigravity: 87% of $5.00 daily budget used
+```
+
+- `tier=<tier> (<confidence>)` appears once a routing decision has been recorded
+- `⚠ …` appears when one or more candidate providers are at 80%+ of their daily limit
 
 ## Behavior notes
 
@@ -235,6 +303,37 @@ Use the built-in debug commands to verify routing and model resolution:
 /auto-router debug
 /auto-router test-resolve <alias>
 ```
+
+### Tests
+
+The routing policy modules under `src/` are covered by a `node:test` + `tsx` suite:
+
+```bash
+npm test
+```
+
+## Architecture
+
+The intelligent routing layer lives in `src/` and is composed of small, focused modules:
+
+| Module                    | Responsibility                                                                                       |
+| ------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `types.ts`                | Shared types: `Tier`, `RouteTarget`, `RoutingContext`, `RoutingDecision`, `BudgetState`, etc.        |
+| `context-analyzer.ts`     | Token estimation (`chars/4`), context classification (short/medium/long/epic), `RoutingContext` build |
+| `shortcut-parser.ts`      | Parses `@reasoning`/`@swe`/`@long`/`@vision`/`@fast` from prompts; strips the token before dispatch  |
+| `constraint-solver.ts`    | Filters candidates by capability, cooldown, and tier-derived requirements                            |
+| `policy-engine.ts`        | Priority-ordered rule registry with shadow mode + last-decision tracking                             |
+| `budget-tracker.ts`       | Persistent daily token/cost stats per provider with atomic writes; daily limits                      |
+| `budget-auditor.ts`       | Pure `auditBudget(provider, state)` returning `ok | warning | blocked`                               |
+
+`index.ts` wires these together inside `streamAutoRouter`:
+
+1. Parse `@` shortcut from the last user message
+2. Build `RoutingContext` (prompt, history, healthy targets, budget state)
+3. Run `solveConstraints` over healthy targets with capability data from the model registry
+4. Run `auditBudget` per remaining candidate; drop blocked, warn at 80%+
+5. Record a `RoutingDecision` (phase, tier, target, confidence, reasoning, estimated tokens, budget remaining)
+6. Stream from the selected target with same-request failover; on success, record token usage
 
 ## License
 

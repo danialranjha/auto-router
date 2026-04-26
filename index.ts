@@ -13,6 +13,12 @@ import {
   type SimpleStreamOptions,
 } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { buildRoutingContext } from "./src/context-analyzer.ts";
+import { DEFAULT_SHORTCUTS, listShortcuts, parseShortcut } from "./src/shortcut-parser.ts";
+import { inferRequirements, solveConstraints, type CapabilityMap, type ConstraintRequirements } from "./src/constraint-solver.ts";
+import { BudgetTracker, todayKey } from "./src/budget-tracker.ts";
+import { auditBudget } from "./src/budget-auditor.ts";
+import type { RoutingDecision, Tier, Message as RoutingMessage } from "./src/types.ts";
 
 const PROVIDER_ID = "auto-router";
 const AUTH_PATH = join(homedir(), ".pi", "agent", "auth.json");
@@ -49,7 +55,22 @@ type CooldownState = {
 const cooldowns = new Map<string, CooldownState>();
 const lastAttemptByRoute = new Map<string, string>();
 const activeTargetByRoute = new Map<string, string>();
+const lastDecisionByRoute = new Map<string, RoutingDecision>();
+const lastShortcutByRoute = new Map<string, { shortcut: string; tier: Tier }>();
+const lastBudgetWarningByRoute = new Map<string, string>();
+const budgetTracker = new BudgetTracker();
+let budgetReady = false;
 let latestUiContext: any;
+
+async function ensureBudgetLoaded(): Promise<void> {
+  if (budgetReady) return;
+  try {
+    await budgetTracker.load();
+  } catch {
+    // ignore - tracker resets to defaults internally
+  }
+  budgetReady = true;
+}
 
 const DEFAULT_ROUTES: Record<string, RouteDefinition> = {
   "subscription-premium": {
@@ -425,7 +446,7 @@ async function tryTarget(
   target: RouteTarget,
   context: Context,
   options?: SimpleStreamOptions,
-): Promise<{ success: boolean; retryableFailure?: string; terminalError?: AssistantMessage }> {
+): Promise<{ success: boolean; retryableFailure?: string; terminalError?: AssistantMessage; lastMessage?: AssistantMessage }> {
   activeTargetByRoute.set(outerModel.id, describeTarget(target));
   refreshStatus(outerModel.id);
   const token = target.authProvider ? getAccessToken(target.authProvider) : undefined;
@@ -536,7 +557,80 @@ async function tryTarget(
     };
   }
 
-  return { success: true };
+  return { success: true, lastMessage };
+}
+
+function extractLastUserText(context: Context): { text: string; index: number; partIndex: number | null } | null {
+  const messages = (context as any)?.messages;
+  if (!Array.isArray(messages)) return null;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (!msg || msg.role !== "user") continue;
+    const content = msg.content;
+    if (typeof content === "string") {
+      return { text: content, index: i, partIndex: null };
+    }
+    if (Array.isArray(content)) {
+      for (let p = 0; p < content.length; p++) {
+        const part = content[p];
+        if (part && typeof part === "object" && typeof (part as any).text === "string") {
+          return { text: (part as any).text, index: i, partIndex: p };
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function applyCleanedPrompt(context: Context, location: { index: number; partIndex: number | null }, cleaned: string): void {
+  const messages = (context as any)?.messages;
+  if (!Array.isArray(messages)) return;
+  const msg = messages[location.index];
+  if (!msg) return;
+  if (location.partIndex === null) {
+    msg.content = cleaned;
+    return;
+  }
+  const parts = msg.content;
+  if (Array.isArray(parts) && parts[location.partIndex]) {
+    parts[location.partIndex] = { ...parts[location.partIndex], text: cleaned };
+  }
+}
+
+function getRoutingMessages(context: Context, excludeIndex: number): RoutingMessage[] {
+  const messages = (context as any)?.messages;
+  if (!Array.isArray(messages)) return [];
+  const out: RoutingMessage[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    if (i === excludeIndex) continue;
+    const m = messages[i];
+    if (m && typeof m.role === "string") out.push({ role: m.role, content: m.content });
+  }
+  return out;
+}
+
+function lookupCapabilities(target: RouteTarget, context: Context): CapabilityMap | undefined {
+  const model = resolveModelFromRegistry(target, context);
+  if (!model) return undefined;
+  const input = (model as any).input ?? [];
+  return {
+    vision: Array.isArray(input) ? input.includes("image") : undefined,
+    reasoning: typeof (model as any).reasoning === "boolean" ? (model as any).reasoning : undefined,
+    contextWindow: typeof (model as any).contextWindow === "number" ? (model as any).contextWindow : undefined,
+    maxTokens: typeof (model as any).maxTokens === "number" ? (model as any).maxTokens : undefined,
+  };
+}
+
+function tierToRequirements(tier: Tier | undefined, estimatedTokens: number): ConstraintRequirements {
+  const reqs: ConstraintRequirements = {};
+  if (tier === "vision") reqs.vision = true;
+  if (tier === "reasoning" || tier === "swe") reqs.reasoning = true;
+  if (tier === "long") reqs.minContextWindow = Math.max(estimatedTokens, 100_000);
+  return reqs;
+}
+
+function recordDecision(routeId: string, decision: RoutingDecision): void {
+  lastDecisionByRoute.set(routeId, decision);
 }
 
 function streamAutoRouter(model: Model<Api>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
@@ -547,17 +641,128 @@ function streamAutoRouter(model: Model<Api>, context: Context, options?: SimpleS
     const errors: string[] = [];
     try {
       loadRoutesConfig();
-      const targets = getHealthyTargets(routeId);
+      await ensureBudgetLoaded();
+
+      const userMsg = extractLastUserText(context);
+      const match = userMsg ? parseShortcut(userMsg.text) : null;
+      if (match && userMsg) {
+        applyCleanedPrompt(context, userMsg, match.cleanedPrompt);
+        lastShortcutByRoute.set(routeId, { shortcut: match.shortcut, tier: match.tier });
+      } else {
+        lastShortcutByRoute.delete(routeId);
+      }
+
+      const promptText = match?.cleanedPrompt ?? userMsg?.text ?? "";
+      const history = userMsg ? getRoutingMessages(context, userMsg.index) : [];
+      const healthy = getHealthyTargets(routeId);
+
+      const budgetState = budgetTracker.getBudgetState();
+      const ctx = buildRoutingContext({
+        prompt: promptText,
+        history,
+        routeId,
+        availableTargets: healthy,
+        userHint: match?.tier,
+        budgetState,
+      });
+
+      const requirements = inferRequirements(ctx, tierToRequirements(match?.tier, ctx.estimatedTokens));
+      const solved = solveConstraints(ctx, {
+        requirements,
+        capabilities: (t) => lookupCapabilities(t, context),
+        isOnCooldown: (t) => {
+          const c = cooldowns.get(getTargetKey(t));
+          return !!c && c.until > Date.now();
+        },
+      });
+
+      const auditedRejections: string[] = [];
+      const budgetWarnings: string[] = [];
+      const auditedCandidates: RouteTarget[] = [];
+      for (const cand of solved.candidates) {
+        const audit = auditBudget(cand.provider, budgetState);
+        if (audit.status === "blocked") {
+          auditedRejections.push(`${cand.label}: ${audit.message}`);
+          continue;
+        }
+        if (audit.status === "warning" && audit.message) {
+          budgetWarnings.push(audit.message);
+        }
+        auditedCandidates.push(cand);
+      }
+
+      const targets = auditedCandidates.length > 0
+        ? auditedCandidates
+        : (solved.candidates.length > 0 ? solved.candidates : healthy);
+      const constraintFallback = solved.candidates.length === 0 && solved.rejections.length > 0;
+      const budgetFallback = auditedCandidates.length === 0 && auditedRejections.length > 0;
+
+      if (budgetWarnings.length > 0) {
+        lastBudgetWarningByRoute.set(routeId, budgetWarnings.join(" | "));
+      } else {
+        lastBudgetWarningByRoute.delete(routeId);
+      }
+
       if (targets.length === 0) {
-        outer.push({ type: "error", reason: "error", error: buildCombinedError(model, routeId, ["no healthy route targets available"]) });
+        const parts: string[] = [];
+        if (solved.rejections.length > 0) {
+          parts.push(`constraints unmet (${solved.rejections.map((r) => `${r.target.label}: ${r.reason}`).join("; ")})`);
+        }
+        if (auditedRejections.length > 0) {
+          parts.push(`budget exhausted (${auditedRejections.join("; ")})`);
+        }
+        const reason = parts.length > 0 ? parts.join(" / ") : "no healthy route targets available";
+        outer.push({ type: "error", reason: "error", error: buildCombinedError(model, routeId, [reason]) });
         outer.end();
         return;
       }
+
+      const reasoningParts: string[] = [];
+      if (match) reasoningParts.push(`shortcut ${match.shortcut} → tier=${match.tier}`);
+      reasoningParts.push(`${ctx.classification} context (~${ctx.estimatedTokens} tokens)`);
+      if (constraintFallback) {
+        reasoningParts.push(`constraints unmet for all candidates; falling back to healthy list`);
+      } else if (solved.rejections.length > 0) {
+        reasoningParts.push(`filtered out ${solved.rejections.length} target(s)`);
+      }
+      if (budgetFallback) {
+        reasoningParts.push(`all candidates over budget; falling back`);
+      } else if (auditedRejections.length > 0) {
+        reasoningParts.push(`budget-blocked ${auditedRejections.length} target(s)`);
+      }
+      if (budgetWarnings.length > 0) {
+        reasoningParts.push(`budget warning: ${budgetWarnings.join("; ")}`);
+      }
+      reasoningParts.push(`selected ${targets[0].label}`);
+      const selectedLimit = budgetState.dailyLimit?.[targets[0].provider];
+      const selectedSpend = budgetState.dailySpend?.[targets[0].provider] ?? 0;
+      const budgetRemaining = typeof selectedLimit === "number" && selectedLimit > 0
+        ? Math.max(0, selectedLimit - selectedSpend)
+        : 0;
+      const decision: RoutingDecision = {
+        tier: match?.tier ?? "swe",
+        phase: match ? "shortcut" : "default",
+        target: targets[0],
+        reasoning: reasoningParts.join(" | "),
+        metadata: {
+          estimatedTokens: ctx.estimatedTokens,
+          budgetRemaining,
+          confidence: match ? 0.9 : 0.5,
+        },
+      };
+      recordDecision(routeId, decision);
 
       for (const target of targets) {
         lastAttemptByRoute.set(routeId, target.label);
         const result = await tryTarget(outer, model, target, context, options);
         if (result.success) {
+          if (result.lastMessage?.usage) {
+            try {
+              await budgetTracker.recordUsage(target.provider, result.lastMessage.usage);
+            } catch {
+              // ignore - never fail a successful response on stats write error
+            }
+          }
           activeTargetByRoute.delete(routeId);
           refreshStatus(routeId);
           outer.end();
@@ -596,7 +801,11 @@ function getStatusLine(routeId?: string): string {
   const activeTarget = activeTargetByRoute.get(routeId);
   const lastTarget = lastAttemptByRoute.get(routeId);
   const active = activeTarget ? `current: ${activeTarget}` : lastTarget ? `last: ${lastTarget}` : "no calls yet";
-  return `auto-router ${getRouteName(routeId)} | ${active} | healthy: ${healthy.join(", ") || "none"} | ${formatCooldowns(routeId)}`;
+  const decision = lastDecisionByRoute.get(routeId);
+  const tierHint = decision ? ` | tier=${decision.tier} (${decision.metadata.confidence.toFixed(2)})` : "";
+  const budgetWarning = lastBudgetWarningByRoute.get(routeId);
+  const budgetText = budgetWarning ? ` | ⚠ ${budgetWarning}` : "";
+  return `auto-router ${getRouteName(routeId)}${tierHint} | ${active} | healthy: ${healthy.join(", ") || "none"} | ${formatCooldowns(routeId)}${budgetText}`;
 }
 
 function refreshStatus(routeId?: string) {
@@ -801,8 +1010,92 @@ export default function (pi: ExtensionAPI) {
         cooldowns.clear();
         lastAttemptByRoute.clear();
         activeTargetByRoute.clear();
+        lastDecisionByRoute.clear();
+        lastShortcutByRoute.clear();
+        lastBudgetWarningByRoute.clear();
         updateUi(ctx);
-        ctx.ui.notify("Auto-router cooldowns reset", "success");
+        ctx.ui.notify("Auto-router cooldowns and decision history reset", "success");
+        return;
+      }
+
+      if (subcommand === "budget") {
+        await ensureBudgetLoaded();
+        const [actionRaw, ...restArgs] = remainder ? remainder.split(/\s+/) : [];
+        const action = String(actionRaw ?? "show").toLowerCase();
+        if (action === "show" || action === "" || !actionRaw) {
+          const summary = budgetTracker.getDailySummary();
+          const day = todayKey();
+          if (summary.length === 0) {
+            ctx.ui.notify(`No budget activity yet for ${day}. Set a limit with: /auto-router budget set <provider> <usd>`, "info");
+            return;
+          }
+          const lines = summary.map((s) => {
+            const limitText = typeof s.limitUsd === "number" ? `limit $${s.limitUsd.toFixed(2)}` : "no limit";
+            const ratio = typeof s.limitUsd === "number" && s.limitUsd > 0 ? ` (${Math.round((s.estimatedCost / s.limitUsd) * 100)}%)` : "";
+            return `  ${s.provider.padEnd(22)} spend $${s.estimatedCost.toFixed(2)} | in ${s.inputTokens} | out ${s.outputTokens} | ${limitText}${ratio}`;
+          });
+          ctx.ui.notify([`Auto-router budget for ${day}:`, ...lines, "", `Stats file: ${budgetTracker.getPath()}`].join("\n"), "info");
+          return;
+        }
+        if (action === "set") {
+          const provider = restArgs[0];
+          const amount = Number(restArgs[1]);
+          if (!provider || !Number.isFinite(amount) || amount <= 0) {
+            ctx.ui.notify("Usage: /auto-router budget set <provider> <dailyUsd>", "error");
+            return;
+          }
+          await budgetTracker.setDailyLimit(provider, amount);
+          ctx.ui.notify(`Set daily budget for ${provider} = $${amount.toFixed(2)}`, "info");
+          return;
+        }
+        if (action === "clear") {
+          const provider = restArgs[0];
+          if (!provider) {
+            ctx.ui.notify("Usage: /auto-router budget clear <provider>", "error");
+            return;
+          }
+          await budgetTracker.clearDailyLimit(provider);
+          ctx.ui.notify(`Cleared daily budget for ${provider}`, "info");
+          return;
+        }
+        ctx.ui.notify("Usage: /auto-router budget [show|set <provider> <usd>|clear <provider>]", "error");
+        return;
+      }
+
+      if (subcommand === "explain") {
+        const routeId = remainder || activeRouteId;
+        if (!routeId) {
+          ctx.ui.notify("Usage: /auto-router explain <routeId>  (or select an auto-router model first)", "error");
+          return;
+        }
+        const decision = lastDecisionByRoute.get(routeId);
+        if (!decision) {
+          ctx.ui.notify(`No routing decision recorded yet for ${routeId}. Send a prompt first.`, "info");
+          return;
+        }
+        const shortcut = lastShortcutByRoute.get(routeId);
+        const lines = [
+          `Last routing decision for ${routeId}:`,
+          `  phase:      ${decision.phase}`,
+          `  tier:       ${decision.tier}`,
+          `  target:     ${describeTarget(decision.target)}`,
+          `  confidence: ${decision.metadata.confidence.toFixed(2)}`,
+          `  est tokens: ${decision.metadata.estimatedTokens}`,
+          shortcut ? `  shortcut:   ${shortcut.shortcut} (tier=${shortcut.tier})` : `  shortcut:   none`,
+          `  reasoning:  ${decision.reasoning}`,
+        ];
+        ctx.ui.notify(lines.join("\n"), "info");
+        return;
+      }
+
+      if (subcommand === "shortcuts") {
+        const lines = listShortcuts(DEFAULT_SHORTCUTS).map((s) => `  ${s.shortcut.padEnd(12)} → tier=${s.tier.padEnd(10)} ${s.description}`);
+        ctx.ui.notify([
+          "Available @ shortcuts (include in your prompt to bias routing):",
+          ...lines,
+          "",
+          "Example: @reasoning explain how transformers work",
+        ].join("\n"), "info");
         return;
       }
 
@@ -911,6 +1204,9 @@ export default function (pi: ExtensionAPI) {
         "/auto-router aliases",
         "/auto-router resolve <alias>",
         "/auto-router models",
+        "/auto-router explain [routeId]",
+        "/auto-router shortcuts",
+        "/auto-router budget [show|set <provider> <usd>|clear <provider>]",
         "/auto-router test-resolve <provider/modelId>",
         "/auto-router debug",
         "/auto-router reload",
