@@ -361,12 +361,13 @@ function isRetryableError(message: any): boolean {
   // Be conservative with single-word tokens — they're prone to false positives.
   return [
     "429", "rate limit", "ratelimit", "too many requests",
+    "overloaded", "over capacity", "capacity reached", "busy",
     "temporarily unavailable", "timeout", "timed out", "econnreset", "etimedout",
     "network", "connection", "try again", "internal server error",
     "502", "503", "504", "500",
     "quota", "quota will reset", "quota exceeded",
     "hit your limit", "credits exhausted", "insufficient balance",
-    "bad gateway", "service unavailable", "gateway timeout", "busy", "upstream",
+    "bad gateway", "service unavailable", "gateway timeout", "upstream",
     "invalid 'input", "call_id", "function_response.name", "required_field_missing",
     "400 status code", "invalid_request_error", "invalid google cloud code assist credentials"
   ].some((needle) => text.includes(needle));
