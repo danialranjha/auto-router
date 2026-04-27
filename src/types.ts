@@ -123,3 +123,38 @@ export type LatencyRecord = {
   lastMs: number;
   updatedAt: number;
 };
+
+export type RoutingHints = {
+  /** Override the tier derived from shortcut/intent */
+  tierOverride?: Tier;
+  /** Force capability constraints regardless of context */
+  forceReasoning?: boolean;
+  forceVision?: boolean;
+  forceMinContext?: number;
+  /** Provider-level overrides for the candidate list */
+  requireProvider?: string;
+  excludeProviders?: string[];
+  preferProviders?: string[];
+  /** Constrain to a specific billing model */
+  enforceBilling?: BillingModel;
+};
+
+/** JSON-serializable rule definition loaded from auto-router.routes.json */
+export type PolicyRuleConfig = {
+  name: string;
+  priority: number;
+  type: "force-tier" | "prefer-provider" | "exclude-provider" | "force-billing" | "force-constraint";
+  tier?: Tier;
+  provider?: string | string[];
+  billing?: BillingModel;
+  constraint?: Partial<{
+    reasoning: boolean;
+    vision: boolean;
+    minContextWindow: number;
+  }>;
+  condition?: {
+    intent?: "code" | "creative" | "analysis" | "general";
+    estimatedTokensMin?: number;
+    estimatedTokensMax?: number;
+  };
+};

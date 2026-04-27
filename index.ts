@@ -23,9 +23,10 @@ import { getProviderHealthCache } from "./src/health-check.ts";
 import { LatencyTracker } from "./src/latency-tracker.ts";
 import { classifyIntent, intentToTier, type IntentResult } from "./src/intent-classifier.ts";
 import { FeedbackTracker } from "./src/feedback-tracker.ts";
+import { PolicyEngine, buildStrategyRules } from "./src/policy-engine.ts";
 import { fetchAllBalances, buildMonthlyQuotaWindow } from "./src/balance-fetcher.ts";
 import { aggregateProviderUVI } from "./src/uvi.ts";
-import type { RoutingDecision, Tier, Message as RoutingMessage, UtilizationSnapshot, BillingModel, BalanceState, QuotaWindow } from "./src/types.ts";
+import type { RoutingDecision, Tier, Message as RoutingMessage, UtilizationSnapshot, BillingModel, BalanceState, QuotaWindow, PolicyRuleConfig } from "./src/types.ts";
 
 const PROVIDER_ID = "auto-router";
 const AUTH_PATH = join(homedir(), ".pi", "agent", "auth.json");
@@ -47,6 +48,7 @@ type RouteDefinition = {
   contextWindow?: number;
   maxTokens?: number;
   targets: RouteTarget[];
+  policyRules?: PolicyRuleConfig[];
 };
 
 type RoutesFile = {
@@ -71,6 +73,7 @@ const budgetTracker = new BudgetTracker();
 const quotaCache = new QuotaCache();
 const latencyTracker = new LatencyTracker();
 const feedbackTracker = new FeedbackTracker();
+const policyEngine = new PolicyEngine();
 const balanceCache = new Map<string, BalanceState>();
 let balanceLastRefreshAt = 0;
 let balanceFetchErrors: Record<string, string> = {};
@@ -409,6 +412,15 @@ function loadRoutesConfig(): void {
           throw new Error(`route ${routeId} has an invalid target entry`);
         }
       }
+      // Parse optional policy rules for this route
+      let policyRules: PolicyRuleConfig[] | undefined;
+      const rawRules = (routeDef as Record<string, unknown>).policyRules;
+      if (Array.isArray(rawRules)) {
+        policyRules = rawRules.filter((r): r is PolicyRuleConfig =>
+          r && typeof r === "object" && typeof (r as PolicyRuleConfig).name === "string" && typeof (r as PolicyRuleConfig).type === "string"
+        );
+      }
+
       nextRoutes[routeId] = {
         name: typeof routeDef.name === "string" ? routeDef.name : routeId,
         reasoning: typeof routeDef.reasoning === "boolean" ? routeDef.reasoning : true,
@@ -416,6 +428,7 @@ function loadRoutesConfig(): void {
         contextWindow: typeof routeDef.contextWindow === "number" ? routeDef.contextWindow : undefined,
         maxTokens: typeof routeDef.maxTokens === "number" ? routeDef.maxTokens : undefined,
         targets: targets.map((target) => ({ ...target })),
+        policyRules,
       };
     }
 
@@ -443,11 +456,22 @@ function loadRoutesConfig(): void {
 
     routesCache = Object.keys(nextRoutes).length > 0 ? nextRoutes : DEFAULT_ROUTES;
     aliasesCache = Object.keys(nextAliases).length > 0 ? nextAliases : DEFAULT_ALIASES;
+    rebuildPolicyEngine();
   } catch (error) {
     configError = error instanceof Error ? error.message : String(error);
     routesCache = DEFAULT_ROUTES;
     aliasesCache = DEFAULT_ALIASES;
+    rebuildPolicyEngine();
   }
+}
+
+/** Rebuild the policy engine from all loaded route configs. */
+function rebuildPolicyEngine(): void {
+  const allRules: PolicyRuleConfig[] = [];
+  for (const route of Object.values(routesCache)) {
+    if (route.policyRules) allRules.push(...route.policyRules);
+  }
+  policyEngine.rebuildStrategyRules(buildStrategyRules(allRules));
 }
 
 function normalizeModelToken(value: string): string {
@@ -945,7 +969,36 @@ function streamAutoRouter(model: Model<Api>, context: Context, options?: SimpleS
         budgetState,
       });
 
-      const requirements = inferRequirements(ctx, tierToRequirements(effectiveTier, ctx.estimatedTokens));
+      // === PolicyEngine: evaluate strategy rules (pre-constraint) ===
+      let effectiveTierFinal = effectiveTier;
+      let filteredHealthy = healthy;
+      const strategyHints = policyEngine.evaluateStrategy(ctx);
+      if (strategyHints) {
+        // Apply tier override
+        if (strategyHints.tierOverride) effectiveTierFinal = strategyHints.tierOverride;
+        // Apply provider exclusions
+        if (strategyHints.excludeProviders && strategyHints.excludeProviders.length > 0) {
+          const excludeSet = new Set(strategyHints.excludeProviders);
+          filteredHealthy = healthy.filter((t) => !excludeSet.has(t.provider));
+          // Rebuild ctx with filtered targets so constraint solver sees the reduced set
+          ctx.availableTargets = filteredHealthy;
+        }
+        // Apply billing model enforcement
+        if (strategyHints.enforceBilling) {
+          filteredHealthy = filteredHealthy.filter((t) => getTargetBilling(t) === strategyHints.enforceBilling);
+          ctx.availableTargets = filteredHealthy;
+        }
+      }
+
+      const requirements = inferRequirements(ctx, tierToRequirements(effectiveTierFinal, ctx.estimatedTokens));
+      // Merge strategy constraint overrides into requirements
+      if (strategyHints) {
+        if (strategyHints.forceReasoning) requirements.reasoning = true;
+        if (strategyHints.forceVision) requirements.vision = true;
+        if (typeof strategyHints.forceMinContext === "number") {
+          requirements.minContextWindow = Math.max(requirements.minContextWindow ?? 0, strategyHints.forceMinContext);
+        }
+      }
       const solved = solveConstraints(ctx, {
         requirements,
         capabilities: (t) => lookupCapabilities(t, context),
@@ -974,6 +1027,45 @@ function streamAutoRouter(model: Model<Api>, context: Context, options?: SimpleS
       partition.promoted.sort(latencySort);
       partition.normal.sort(latencySort);
       partition.demoted.sort(latencySort);
+
+      // === PolicyEngine: apply post-partition hints (prefer/require providers) ===
+      if (strategyHints?.requireProvider) {
+        // Move the required provider to the front of promoted (or normal if no promoted)
+        const reqProv = strategyHints.requireProvider;
+        const moveToFront = (arr: RouteTarget[]) => {
+          const idx = arr.findIndex((t) => t.provider === reqProv);
+          if (idx > 0) {
+            const [item] = arr.splice(idx, 1);
+            arr.unshift(item);
+          }
+        };
+        moveToFront(partition.promoted);
+        moveToFront(partition.normal);
+        // If the required provider isn't in any bucket but is in demoted, promote it
+        const inDemoted = partition.demoted.findIndex((t) => t.provider === reqProv);
+        if (inDemoted >= 0) {
+          const [item] = partition.demoted.splice(inDemoted, 1);
+          partition.normal.unshift(item);
+        }
+      }
+      if (strategyHints?.preferProviders && strategyHints.preferProviders.length > 0) {
+        const preferSet = new Set(strategyHints.preferProviders);
+        const preferSort = (a: RouteTarget, b: RouteTarget): number => {
+          const aPref = preferSet.has(a.provider) ? 0 : 1;
+          const bPref = preferSet.has(b.provider) ? 0 : 1;
+          if (aPref !== bPref) return aPref - bPref;
+          // Within same preference group, sort by latency
+          const la = latencyTracker.getAvgLatency(a.provider);
+          const lb = latencyTracker.getAvgLatency(b.provider);
+          if (la === null && lb === null) return 0;
+          if (la === null) return 1;
+          if (lb === null) return -1;
+          return la - lb;
+        };
+        partition.promoted.sort(preferSort);
+        partition.normal.sort(preferSort);
+        // Leave demoted as-is (don't promote stressed providers via preference)
+      }
       const orderedAudited = [...partition.promoted, ...partition.normal, ...partition.demoted];
       const pipelineTargets = orderedAudited.length > 0
         ? orderedAudited
@@ -1028,7 +1120,19 @@ function streamAutoRouter(model: Model<Api>, context: Context, options?: SimpleS
 
       const reasoningParts: string[] = [];
       if (match) reasoningParts.push(`shortcut ${match.shortcut} → tier=${match.tier}`);
-      if (intent && intent.category !== "general") reasoningParts.push(`intent ${intent.category} (${(intent.confidence * 100).toFixed(0)}%) → tier=${effectiveTier}`);
+      if (intent && intent.category !== "general") reasoningParts.push(`intent ${intent.category} (${(intent.confidence * 100).toFixed(0)}%) → tier=${effectiveTierFinal}`);
+      if (strategyHints) {
+        const ruleNames = policyEngine.getLastHints()?.ruleName;
+        const stratParts: string[] = [];
+        if (strategyHints.tierOverride) stratParts.push(`tier→${strategyHints.tierOverride}`);
+        if (strategyHints.preferProviders?.length) stratParts.push(`prefer=[${strategyHints.preferProviders.join(",")}]`);
+        if (strategyHints.excludeProviders?.length) stratParts.push(`exclude=[${strategyHints.excludeProviders.join(",")}]`);
+        if (strategyHints.requireProvider) stratParts.push(`require=${strategyHints.requireProvider}`);
+        if (stratParts.length > 0) {
+          const label = ruleNames ? `strategy:${ruleNames}` : "strategy";
+          reasoningParts.push(`${label} ${stratParts.join(" ")}`);
+        }
+      }
       reasoningParts.push(`${ctx.classification} context (~${ctx.estimatedTokens} tokens)`);
       if (constraintFallback) {
         reasoningParts.push(`constraints unmet for all candidates; falling back to healthy list`);
@@ -1412,6 +1516,7 @@ export default function (pi: ExtensionAPI) {
         getProviderHealthCache().clear();
         latencyTracker.clear();
         feedbackTracker.clear();
+        policyEngine.reset();
         balanceCache.clear();
         balanceFetchErrors = {};
         updateUi(ctx);
@@ -1736,6 +1841,42 @@ export default function (pi: ExtensionAPI) {
           "",
           "Example: @reasoning explain how transformers work",
         ].join("\n"), "info");
+        return;
+      }
+
+      if (subcommand === "rules") {
+        const strategyRules = policyEngine.getStrategyRules();
+        const allRules = policyEngine.getRules();
+        const lastHints = policyEngine.getLastHints();
+        const lines: string[] = [];
+        if (strategyRules.length === 0 && allRules.length === 0) {
+          lines.push("  No policy rules configured.");
+          lines.push("");
+          lines.push("  Add policyRules to a route in auto-router.routes.json:");
+          lines.push('  "policyRules": [');
+          lines.push('    { "name": "prefer-claude", "type": "prefer-provider", "provider": "claude-agent-sdk", "priority": 1 }');
+          lines.push('  ]');
+        } else {
+          if (strategyRules.length > 0) {
+            lines.push(`Strategy rules (${strategyRules.length}):`);
+            for (const r of strategyRules) {
+              lines.push(`  ${r.name.padEnd(24)} priority=${r.priority}`);
+            }
+          }
+          if (allRules.length > 0) {
+            if (strategyRules.length > 0) lines.push("");
+            lines.push(`Decision rules (${allRules.length}):`);
+            for (const r of allRules) {
+              lines.push(`  ${r.name.padEnd(24)} priority=${r.priority}`);
+            }
+          }
+        }
+        if (lastHints) {
+          lines.push("");
+          lines.push(`Last applied: ${lastHints.ruleName}`);
+          lines.push(`  hints: ${JSON.stringify(lastHints.hints)}`);
+        }
+        ctx.ui.notify(lines.join("\n"), "info");
         return;
       }
 
