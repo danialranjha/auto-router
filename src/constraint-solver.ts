@@ -20,6 +20,7 @@ export type SolveOptions = {
   requirements?: ConstraintRequirements;
   capabilities?: CapabilityLookup;
   isOnCooldown?: (target: RouteTarget) => boolean;
+  isHealthy?: (target: RouteTarget) => boolean;
 };
 
 export type Rejection = { target: RouteTarget; reason: string };
@@ -30,11 +31,15 @@ export type SolveResult = {
 };
 
 export function solveConstraints(ctx: RoutingContext, options: SolveOptions = {}): SolveResult {
-  const { requirements = {}, capabilities, isOnCooldown } = options;
+  const { requirements = {}, capabilities, isOnCooldown, isHealthy } = options;
   const candidates: RouteTarget[] = [];
   const rejections: Rejection[] = [];
 
   for (const target of ctx.availableTargets) {
+    if (isHealthy && !isHealthy(target)) {
+      rejections.push({ target, reason: "provider unhealthy" });
+      continue;
+    }
     if (isOnCooldown && isOnCooldown(target)) {
       rejections.push({ target, reason: "on cooldown" });
       continue;

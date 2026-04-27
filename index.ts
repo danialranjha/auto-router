@@ -19,6 +19,7 @@ import { inferRequirements, solveConstraints, type CapabilityMap, type Constrain
 import { BudgetTracker, todayKey } from "./src/budget-tracker.ts";
 import { partitionAuditedCandidates } from "./src/candidate-partitioner.ts";
 import { QuotaCache, mapRouteProviderToOAuth } from "./src/quota-cache.ts";
+import { getProviderHealthCache } from "./src/health-check.ts";
 import type { RoutingDecision, Tier, Message as RoutingMessage, UtilizationSnapshot } from "./src/types.ts";
 
 const PROVIDER_ID = "auto-router";
@@ -742,6 +743,12 @@ function streamAutoRouter(model: Model<Api>, context: Context, options?: SimpleS
       await ensureBudgetLoaded();
       quotaCache.refreshIfStale();
       syncUtilizationIntoBudget();
+      // Kick off background health checks for all candidate providers.
+      // Non-blocking — results used next prompt or if already cached.
+      const healthCache = getProviderHealthCache();
+      healthCache.checkAllIfStale(
+        healthy.map((t) => ({ provider: t.provider, authProvider: t.authProvider })),
+      );
 
       const userMsg = extractLastUserText(context);
       const match = userMsg ? parseShortcut(userMsg.text) : null;
@@ -774,6 +781,7 @@ function streamAutoRouter(model: Model<Api>, context: Context, options?: SimpleS
           const c = cooldowns.get(getTargetKey(t));
           return !!c && c.until > Date.now();
         },
+        isHealthy: (t) => healthCache.isHealthy(t.provider, t.authProvider),
       });
 
       const partition = partitionAuditedCandidates(solved.candidates, budgetState);
@@ -899,7 +907,8 @@ function getStatusLine(routeId?: string): string {
   const budgetWarning = lastBudgetWarningByRoute.get(routeId);
   const budgetText = budgetWarning ? ` | ⚠ ${budgetWarning}` : "";
   const uviText = formatUviStatusSegment();
-  return `auto-router ${getRouteName(routeId)}${tierHint} | ${active} | healthy: ${healthy.join(", ") || "none"} | ${formatCooldowns(routeId)}${budgetText}${uviText}`;
+  const healthIssuesText = formatHealthIssuesSegment(healthy);
+  return `auto-router ${getRouteName(routeId)}${tierHint} | ${active} | healthy: ${healthy.join(", ") || "none"} | ${formatCooldowns(routeId)}${budgetText}${healthIssuesText}${uviText}`;
 }
 
 function formatUviStatusSegment(): string {
@@ -909,6 +918,16 @@ function formatUviStatusSegment(): string {
   if (hot.length === 0) return "";
   const parts = hot.map((s) => `${s.provider}=${s.uvi.toFixed(2)} ${s.status}`);
   return ` | uvi: ${parts.join(", ")}`;
+}
+
+function formatHealthIssuesSegment(healthy: Array<{ provider: string; authProvider?: string }>): string {
+  const cache = getProviderHealthCache();
+  const issues: string[] = [];
+  for (const t of healthy) {
+    const err = cache.getHealthError(t.provider, t.authProvider);
+    if (err) issues.push(`${t.provider}: ${err}`);
+  }
+  return issues.length > 0 ? ` | ⚠ health: ${issues.join("; ")}` : "";
 }
 
 function refreshStatus(routeId?: string) {
@@ -936,7 +955,9 @@ function routeSummary(routeId: string): string {
     const cooldown = cooldowns.get(key);
     const cooldownText = cooldown && cooldown.until > Date.now() ? ` | cooldown ${formatRemainingMs(cooldown.until - Date.now())} (Reason: ${cooldown.reason})` : "";
     const authText = target.authProvider ? `auth=${target.authProvider}` : "auth=builtin";
-    const healthText = healthySet.has(key) ? "healthy" : "unavailable";
+    const healthText = healthySet.has(key)
+      ? `healthy${getProviderHealthCache().getHealthError(target.provider, target.authProvider) ? ` (auth issue: ${getProviderHealthCache().getHealthError(target.provider, target.authProvider)})` : ""}`
+      : "unavailable";
     return `${index + 1}. ${target.label || "Unknown"} [${target.provider || "unknown"}/${target.modelId || "unknown"}] | ${authText} | ${healthText}${cooldownText}`;
   });
   return [
@@ -1135,8 +1156,9 @@ export default function (pi: ExtensionAPI) {
         lastDecisionByRoute.clear();
         lastShortcutByRoute.clear();
         lastBudgetWarningByRoute.clear();
+        getProviderHealthCache().clear();
         updateUi(ctx);
-        ctx.ui.notify("Auto-router cooldowns and decision history reset", "success");
+        ctx.ui.notify("Auto-router cooldowns, decision history, and health cache reset", "success");
         return;
       }
 
