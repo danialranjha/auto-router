@@ -760,12 +760,6 @@ function streamAutoRouter(model: Model<Api>, context: Context, options?: SimpleS
       await ensureBudgetLoaded();
       quotaCache.refreshIfStale();
       syncUtilizationIntoBudget();
-      // Kick off background health checks for all candidate providers.
-      // Non-blocking — results used next prompt or if already cached.
-      const healthCache = getProviderHealthCache();
-      healthCache.checkAllIfStale(
-        healthy.map((t) => ({ provider: t.provider, authProvider: t.authProvider })),
-      );
 
       const userMsg = extractLastUserText(context);
       const match = userMsg ? parseShortcut(userMsg.text) : null;
@@ -779,6 +773,13 @@ function streamAutoRouter(model: Model<Api>, context: Context, options?: SimpleS
       const promptText = match?.cleanedPrompt ?? userMsg?.text ?? "";
       const history = userMsg ? getRoutingMessages(context, userMsg.index) : [];
       const healthy = getHealthyTargets(routeId);
+
+      // Kick off background health checks for all candidate providers.
+      // Non-blocking — results used next prompt or if already cached.
+      const healthCache = getProviderHealthCache();
+      healthCache.checkAllIfStale(
+        healthy.map((t) => ({ provider: t.provider, authProvider: t.authProvider })),
+      );
 
       const budgetState = budgetTracker.getBudgetState();
       const ctx = buildRoutingContext({
