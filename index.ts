@@ -129,6 +129,8 @@ function syncUtilizationIntoBudget(): void {
 function getPerTokenProviders(): Array<{ provider: string; authProvider?: string; balanceEndpoint?: string }> {
   const seen = new Set<string>();
   const result: Array<{ provider: string; authProvider?: string; balanceEndpoint?: string }> = [];
+
+  // Collect providers explicitly tagged as per-token in route config
   for (const route of Object.values(routesCache)) {
     for (const target of route.targets) {
       if (target.billing !== "per-token") continue;
@@ -137,6 +139,21 @@ function getPerTokenProviders(): Array<{ provider: string; authProvider?: string
       result.push({ provider: target.provider, authProvider: target.authProvider, balanceEndpoint: target.balanceEndpoint });
     }
   }
+
+  // Also include any provider that has a monthly budget set (implicit per-token)
+  const monthlyLimits = budgetTracker.getMonthlyLimits();
+  for (const provider of Object.keys(monthlyLimits)) {
+    if (seen.has(provider)) continue;
+    seen.add(provider);
+    // Try to find authProvider from route config for API key resolution
+    let authProvider: string | undefined;
+    for (const route of Object.values(routesCache)) {
+      const match = route.targets.find((t) => t.provider === provider);
+      if (match) { authProvider = match.authProvider; break; }
+    }
+    result.push({ provider, authProvider });
+  }
+
   return result;
 }
 
@@ -309,7 +326,11 @@ function getTargetKey(target: RouteTarget | undefined | null): string {
 }
 
 function getTargetBilling(target: RouteTarget): BillingModel {
-  return target.billing ?? "subscription";
+  if (target.billing === "per-token") return "per-token";
+  // Auto-detect: if a monthly budget is set for this provider, treat as per-token
+  const monthlyLimits = budgetTracker.getMonthlyLimits();
+  if (monthlyLimits[target.provider]) return "per-token";
+  return "subscription";
 }
 
 function describeTarget(target: RouteTarget | undefined | null): string {
