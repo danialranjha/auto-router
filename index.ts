@@ -841,6 +841,11 @@ function streamAutoRouter(model: Model<Api>, context: Context, options?: SimpleS
 
       if (targets.length === 0) {
         const parts: string[] = [];
+        // If the route doesn't exist at all, give a helpful error
+        if (!(routeId in routesCache)) {
+          const available = Object.keys(routesCache).join(", ");
+          parts.push(`route "${routeId}" not found. Available: ${available || "none"}`);
+        }
         if (solved.rejections.length > 0) {
           parts.push(`constraints unmet (${solved.rejections.map((r) => `${r.target.label}: ${r.reason}`).join("; ")})`);
         }

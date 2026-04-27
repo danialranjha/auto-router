@@ -80,6 +80,11 @@ Phases 1–6 are **complete**. Phase 7 (UVI dynamic budget reallocation) is **sh
 | 6 | **User feedback loop** (`/auto-router rate <good|bad>`) — learn from user ratings over time | Medium | Medium |
 | 7 | **Intent classification** — classify prompts as code/creative/analysis to inform tier selection | Medium | Low-Medium |
 
+### Housekeeping
+| # | Feature | Effort |
+|---|---------|--------|
+| 8 | **Update README route names** — replace old `subscription-premium`/`subscription-coding` with actual route names; add helpful error when user requests non-existent route | Low |
+
 ## Success Metrics
 - ✅ Zero regressions in existing failover behavior
 - ✅ Routing decisions explainable via `/auto-router explain`
@@ -88,6 +93,7 @@ Phases 1–6 are **complete**. Phase 7 (UVI dynamic budget reallocation) is **sh
 - ✅ Auth token expiration handled gracefully with failover
 - ✅ Provider validation errors sanitized before sending
 - ✅ All 5 route chains verified in non-interactive mode
+- ✅ Tier 1 features verified: shadow mode, UVI hard mode, health checks all pass with pi -p
 
 ## Backward Compatibility
 - Routes config: all existing configs work unchanged
