@@ -17,6 +17,49 @@ export type Message = {
 export type BudgetState = {
   dailySpend: Record<string, number>;
   dailyLimit: Record<string, number>;
+  utilization?: Record<string, UtilizationSnapshot>;
+};
+
+export type QuotaScope = "session" | "weekly" | "monthly" | "daily";
+
+export type QuotaSource = "oauth-usage" | "stale-cache" | "config";
+
+export type QuotaWindow = {
+  provider: string;
+  scope: QuotaScope;
+  usedPercent: number;
+  resetsAt?: string;
+  resetsInSec?: number;
+  windowDurationMs: number;
+  source: QuotaSource;
+  fetchedAt: number;
+};
+
+export type UVIStatus = "ok" | "surplus" | "stressed" | "critical";
+
+export type UtilizationSnapshot = {
+  provider: string;
+  uvi: number;
+  status: UVIStatus;
+  windows: QuotaWindow[];
+  reason: string;
+  error?: string;
+  stale?: boolean;
+  fetchedAt: number;
+};
+
+export type UVIThresholds = {
+  stressed: number;
+  critical: number;
+  surplus: number;
+  surplusMinElapsed: number;
+};
+
+export const DEFAULT_UVI_THRESHOLDS: UVIThresholds = {
+  stressed: 1.5,
+  critical: 2.0,
+  surplus: 0.5,
+  surplusMinElapsed: 0.7,
 };
 
 export type RoutingDecision = {

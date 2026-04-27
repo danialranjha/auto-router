@@ -179,14 +179,16 @@ type ContextClassification = 'short' | 'medium' | 'long' | 'epic';
 - [x] Budget warnings at thresholds
 - [x] Route summary showing target health and auth status
 
-### Phase 7: ⬜ Advanced Features (Future)
+### Phase 7: 🟡 Advanced Features (Partial)
 - [ ] Performance-based ranking (track latency per provider)
 - [ ] Intent classification (code vs creative vs analysis)
-- [ ] **Dynamic budget reallocation (Utilization Velocity Index)**:
-    - Shift from static USD limits to real-time quota pressure sensing by polling status from OAuth providers (Claude, Gemini, etc.).
-    - Implement a **Utilization Velocity Index (UVI)** that compares consumed quota percentage against the time remaining in the reset window.
-    - Automatically "tax" high-tier models when they are trending toward premature exhaustion (e.g., 25% used with 85% of the week remaining).
-    - "Unlock" premium models for standard tasks when a surplus is detected near the end of a reset cycle.
+- [x] **Dynamic budget reallocation (Utilization Velocity Index)** — see §9
+    - Polls OAuth usage endpoints for Anthropic, OpenAI Codex, Google Gemini, and Google Antigravity (vendored from `ajarellanod/pi-usage-bars`).
+    - Computes UVI = consumed_fraction / elapsed_fraction_of_window per quota window, takes the worst across windows.
+    - Taxes (deprioritizes) providers with `UVI ≥ 1.5` (stressed) and blocks at `UVI ≥ 2.0` (critical).
+    - Promotes premium providers when `UVI ≤ 0.5` near the end of the reset window (`elapsed ≥ 0.7`).
+    - Surfaced via `/auto-router uvi` and integrated into `/auto-router budget`, the status line, and `explain` reasoning.
+    - Off by default; opt in with `AUTO_ROUTER_UVI=1` or `/auto-router uvi enable`.
 - [ ] Provider health checks (proactive ping)
 - [ ] User feedback loop (`/auto-router rate <good|bad> [reason]`)
 
@@ -259,15 +261,60 @@ streamAutoRouter()
 
 ```
 index.ts                          — Extension entry point, provider registration, streamAutoRouter, tryTarget, sanitizeContext, UI commands
-src/types.ts                      — All type definitions
+src/types.ts                      — All type definitions (incl. QuotaWindow, UtilizationSnapshot, UVIThresholds)
 src/context-analyzer.ts           — Token estimation, history depth, classification
 src/constraint-solver.ts          — Target filtering by capability requirements
-src/budget-tracker.ts             — Daily spend tracking, limits, persistence
-src/budget-auditor.ts             — Budget constraint rule
+src/budget-tracker.ts             — Daily spend tracking, limits, persistence, utilization snapshots
+src/budget-auditor.ts             — Budget + UVI constraint rule (emits promote/demote hints)
 src/policy-engine.ts              — Pipeline orchestrator (skeleton, integrated into index.ts)
 src/shortcut-parser.ts            — @ shortcut parsing, registry
+src/uvi.ts                        — Pure UVI math (computeUVI, classifyUVI, aggregateProviderUVI)
+src/quota-fetcher.ts              — OAuth usage endpoints + adapter to QuotaWindow[] (vendored from ajarellanod/pi-usage-bars)
+src/quota-cache.ts                — TTL-bounded async refresh of utilization snapshots, route→OAuth provider mapping
 tests/                            — Unit tests for all modules
 ```
+
+## 9. Dynamic Budget Reallocation (UVI)
+
+### Overview
+The auto-router can sense real-time quota pressure on each OAuth subscription provider and reorder candidates accordingly, rather than relying solely on static USD limits.
+
+### How it works
+1. `QuotaCache` polls each provider's OAuth usage endpoint via `fetchAllUsages()` (vendored from `pi-usage-bars`):
+   - Anthropic: `api.anthropic.com/api/oauth/usage` (5-hour + 7-day windows)
+   - OpenAI Codex: `chatgpt.com/backend-api/wham/usage` (5-hour + 7-day windows)
+   - Google Gemini / Antigravity: `cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota` (daily window)
+2. Each `UsageData` is converted to `QuotaWindow[]` and aggregated into a `UtilizationSnapshot` per provider.
+3. `BudgetTracker.setUtilization()` plumbs snapshots into `BudgetState.utilization`.
+4. `auditBudget()` consults UVI alongside USD spend:
+   - `UVI ≥ 2.0` → `blocked` (treated like over-budget)
+   - `UVI ≥ 1.5` → `warning` + `hint: "demote"`
+   - `UVI ≤ 0.5` and `elapsed ≥ 0.7` → `ok` + `hint: "promote"`
+5. `streamAutoRouter` partitions audited candidates into `[promoted, normal, demoted]` and tries them in that order.
+
+### Refresh policy
+- Async, non-blocking refresh on each prompt; never adds latency.
+- TTL: 60s (override via `AUTO_ROUTER_UVI_TTL_MS`).
+- Hard floor of 30s between refreshes per provider.
+- Token refresh handled by `@mariozechner/pi-ai`'s `getOAuthApiKey()`.
+
+### Configuration
+- `AUTO_ROUTER_UVI=1` to enable (off by default).
+- `AUTO_ROUTER_UVI_TTL_MS=<ms>` to override TTL.
+- `/auto-router uvi enable|disable|show|refresh` for runtime control.
+
+### Surfaces
+- `/auto-router budget` includes a UVI block per provider.
+- `/auto-router explain` reasoning includes promote/demote notes.
+- Status line gains a `uvi: provider=N.NN stressed` segment when any provider is `stressed`/`critical`.
+
+### Provider name mapping
+`auditBudget` keys by route-config provider name. The cache re-keys snapshots so `claude-agent-sdk` resolves to the `anthropic` snapshot. Other providers (`openai-codex`, `google-gemini-cli`, `google-antigravity`) match 1:1.
+
+### Limitations
+- Google's `retrieveUserQuota` does not expose its window duration; we assume 24h.
+- Snapshot only updates on the prompt *after* a successful refresh (TTL design).
+- Static USD limits still apply on top of UVI — UVI augments rather than replaces.
 
 ## 8. Success Metrics
 

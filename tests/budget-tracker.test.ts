@@ -65,4 +65,25 @@ describe("BudgetTracker", () => {
     await tracker.clearDailyLimit("nvidia");
     assert.equal(tracker.getDailyLimits().nvidia, undefined);
   });
+
+  it("exposes utilization snapshots through getBudgetState", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "auto-router-budget-"));
+    const tracker = new BudgetTracker(join(dir, "stats.json"));
+    await tracker.load();
+    assert.equal(tracker.getBudgetState().utilization, undefined);
+    tracker.setUtilization({
+      anthropic: {
+        provider: "anthropic",
+        uvi: 1.7,
+        status: "stressed",
+        windows: [],
+        reason: "test",
+        fetchedAt: 1,
+      },
+    });
+    const state = tracker.getBudgetState();
+    assert.ok(state.utilization);
+    assert.equal(state.utilization!.anthropic.status, "stressed");
+    assert.equal(tracker.getUtilization().anthropic.uvi, 1.7);
+  });
 });

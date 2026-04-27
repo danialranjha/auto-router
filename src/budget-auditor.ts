@@ -1,4 +1,6 @@
-import type { BudgetState } from "./types.ts";
+import type { BudgetState, UVIStatus, UtilizationSnapshot } from "./types.ts";
+
+export type BudgetAuditHint = "promote" | "demote";
 
 export type BudgetAuditResult = {
   status: "ok" | "warning" | "blocked";
@@ -8,9 +10,13 @@ export type BudgetAuditResult = {
   remaining: number | null;
   usageRatio: number | null;
   message?: string;
+  uvi?: number;
+  utilizationStatus?: UVIStatus;
+  hint?: BudgetAuditHint;
+  utilizationReason?: string;
 };
 
-export function auditBudget(provider: string, budgetState: BudgetState | undefined, estimatedAdditionalUsd = 0): BudgetAuditResult {
+function auditUsd(provider: string, budgetState: BudgetState | undefined, estimatedAdditionalUsd: number): BudgetAuditResult {
   const spend = budgetState?.dailySpend?.[provider] ?? 0;
   const limit = budgetState?.dailyLimit?.[provider];
   if (!(typeof limit === "number") || !Number.isFinite(limit) || limit <= 0) {
@@ -46,4 +52,41 @@ export function auditBudget(provider: string, budgetState: BudgetState | undefin
   }
 
   return { status: "ok", provider, spend, limit, remaining, usageRatio };
+}
+
+function applyUtilization(base: BudgetAuditResult, util: UtilizationSnapshot | undefined, provider: string): BudgetAuditResult {
+  if (!util) return base;
+  const result: BudgetAuditResult = { ...base, uvi: util.uvi, utilizationStatus: util.status, utilizationReason: util.reason };
+
+  if (util.status === "critical") {
+    return {
+      ...result,
+      status: "blocked",
+      message: result.message ?? `${provider} UVI critical (${util.uvi.toFixed(2)}); ${util.reason}`,
+    };
+  }
+
+  if (util.status === "stressed") {
+    const message = `${provider} UVI stressed (${util.uvi.toFixed(2)}); ${util.reason}`;
+    if (result.status === "ok") {
+      return { ...result, status: "warning", hint: "demote", message };
+    }
+    return { ...result, hint: "demote", message: result.message ?? message };
+  }
+
+  if (util.status === "surplus") {
+    return { ...result, hint: "promote" };
+  }
+
+  return result;
+}
+
+export function auditBudget(
+  provider: string,
+  budgetState: BudgetState | undefined,
+  estimatedAdditionalUsd = 0,
+): BudgetAuditResult {
+  const base = auditUsd(provider, budgetState, estimatedAdditionalUsd);
+  const util = budgetState?.utilization?.[provider];
+  return applyUtilization(base, util, provider);
 }

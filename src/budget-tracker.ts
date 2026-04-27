@@ -1,7 +1,7 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import type { BudgetState } from "./types.ts";
+import type { BudgetState, UtilizationSnapshot } from "./types.ts";
 
 export const DEFAULT_STATS_PATH = join(homedir(), ".pi", "agent", "extensions", "auto-router.stats.json");
 
@@ -72,9 +72,18 @@ export class BudgetTracker {
   private stats: BudgetStatsFile = createDefaultStats();
   private loaded = false;
   private readonly path: string;
+  private utilization: Record<string, UtilizationSnapshot> = {};
 
   constructor(path = DEFAULT_STATS_PATH) {
     this.path = path;
+  }
+
+  setUtilization(snapshots: Record<string, UtilizationSnapshot>): void {
+    this.utilization = { ...snapshots };
+  }
+
+  getUtilization(): Record<string, UtilizationSnapshot> {
+    return this.utilization;
   }
 
   getPath(): string {
@@ -124,10 +133,12 @@ export class BudgetTracker {
   }
 
   getBudgetState(day = todayKey()): BudgetState {
-    return {
+    const state: BudgetState = {
       dailySpend: this.getDailySpend(day),
       dailyLimit: this.getDailyLimits(),
     };
+    if (Object.keys(this.utilization).length > 0) state.utilization = this.utilization;
+    return state;
   }
 
   getDailySummary(day = todayKey()): Array<{ provider: string; inputTokens: number; outputTokens: number; estimatedCost: number; limitUsd?: number }> {

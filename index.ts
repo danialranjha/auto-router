@@ -18,7 +18,8 @@ import { DEFAULT_SHORTCUTS, listShortcuts, parseShortcut } from "./src/shortcut-
 import { inferRequirements, solveConstraints, type CapabilityMap, type ConstraintRequirements } from "./src/constraint-solver.ts";
 import { BudgetTracker, todayKey } from "./src/budget-tracker.ts";
 import { auditBudget } from "./src/budget-auditor.ts";
-import type { RoutingDecision, Tier, Message as RoutingMessage } from "./src/types.ts";
+import { QuotaCache, mapRouteProviderToOAuth } from "./src/quota-cache.ts";
+import type { RoutingDecision, Tier, Message as RoutingMessage, UtilizationSnapshot } from "./src/types.ts";
 
 const PROVIDER_ID = "auto-router";
 const AUTH_PATH = join(homedir(), ".pi", "agent", "auth.json");
@@ -59,8 +60,35 @@ const lastDecisionByRoute = new Map<string, RoutingDecision>();
 const lastShortcutByRoute = new Map<string, { shortcut: string; tier: Tier }>();
 const lastBudgetWarningByRoute = new Map<string, string>();
 const budgetTracker = new BudgetTracker();
+const quotaCache = new QuotaCache();
 let budgetReady = false;
 let latestUiContext: any;
+
+function syncUtilizationIntoBudget(): void {
+  if (!quotaCache.isEnabled()) return;
+  const snapshots = quotaCache.getAllSnapshots();
+  // Re-key snapshots by route-config provider names so auditBudget(provider) lookups work.
+  const remapped: Record<string, UtilizationSnapshot> = {};
+  for (const [oauthId, snap] of Object.entries(snapshots)) {
+    remapped[oauthId] = snap;
+    if (oauthId === "anthropic") remapped["claude-agent-sdk"] = snap;
+  }
+  budgetTracker.setUtilization(remapped);
+}
+
+function formatUtilizationLines(cache: QuotaCache): string[] {
+  const snapshots = cache.getAllSnapshots();
+  const entries = Object.entries(snapshots);
+  if (entries.length === 0) return [];
+  return entries.map(([provider, snap]) => {
+    const winSummary = snap.windows.length > 0
+      ? snap.windows.map((w) => `${w.scope}@${w.usedPercent.toFixed(0)}%`).join(", ")
+      : "no windows";
+    const staleTag = snap.stale ? " [stale]" : "";
+    const errTag = snap.error ? ` [err: ${snap.error}]` : "";
+    return `  ${provider.padEnd(22)} UVI=${snap.uvi.toFixed(2).padStart(5)} ${snap.status.padEnd(8)} | ${winSummary}${staleTag}${errTag}`;
+  });
+}
 
 async function ensureBudgetLoaded(): Promise<void> {
   if (budgetReady) return;
@@ -712,6 +740,8 @@ function streamAutoRouter(model: Model<Api>, context: Context, options?: SimpleS
     try {
       loadRoutesConfig();
       await ensureBudgetLoaded();
+      quotaCache.refreshIfStale();
+      syncUtilizationIntoBudget();
 
       const userMsg = extractLastUserText(context);
       const match = userMsg ? parseShortcut(userMsg.text) : null;
@@ -749,6 +779,9 @@ function streamAutoRouter(model: Model<Api>, context: Context, options?: SimpleS
       const auditedRejections: string[] = [];
       const budgetWarnings: string[] = [];
       const auditedCandidates: RouteTarget[] = [];
+      const promotedCandidates: RouteTarget[] = [];
+      const demotedCandidates: RouteTarget[] = [];
+      const uviNotes: string[] = [];
       for (const cand of solved.candidates) {
         const audit = auditBudget(cand.provider, budgetState);
         if (audit.status === "blocked") {
@@ -758,14 +791,23 @@ function streamAutoRouter(model: Model<Api>, context: Context, options?: SimpleS
         if (audit.status === "warning" && audit.message) {
           budgetWarnings.push(audit.message);
         }
-        auditedCandidates.push(cand);
+        if (audit.hint === "promote") {
+          promotedCandidates.push(cand);
+          uviNotes.push(`${cand.label} promoted (UVI=${audit.uvi?.toFixed(2)} surplus)`);
+        } else if (audit.hint === "demote") {
+          demotedCandidates.push(cand);
+          uviNotes.push(`${cand.label} demoted (UVI=${audit.uvi?.toFixed(2)} stressed)`);
+        } else {
+          auditedCandidates.push(cand);
+        }
       }
 
-      const targets = auditedCandidates.length > 0
-        ? auditedCandidates
+      const orderedAudited = [...promotedCandidates, ...auditedCandidates, ...demotedCandidates];
+      const targets = orderedAudited.length > 0
+        ? orderedAudited
         : (solved.candidates.length > 0 ? solved.candidates : healthy);
       const constraintFallback = solved.candidates.length === 0 && solved.rejections.length > 0;
-      const budgetFallback = auditedCandidates.length === 0 && auditedRejections.length > 0;
+      const budgetFallback = orderedAudited.length === 0 && auditedRejections.length > 0;
 
       if (budgetWarnings.length > 0) {
         lastBudgetWarningByRoute.set(routeId, budgetWarnings.join(" | "));
@@ -802,6 +844,9 @@ function streamAutoRouter(model: Model<Api>, context: Context, options?: SimpleS
       }
       if (budgetWarnings.length > 0) {
         reasoningParts.push(`budget warning: ${budgetWarnings.join("; ")}`);
+      }
+      if (uviNotes.length > 0) {
+        reasoningParts.push(`uvi: ${uviNotes.join("; ")}`);
       }
       reasoningParts.push(`selected ${targets[0].label}`);
       const selectedLimit = budgetState.dailyLimit?.[targets[0].provider];
@@ -875,7 +920,17 @@ function getStatusLine(routeId?: string): string {
   const tierHint = decision ? ` | tier=${decision.tier} (${decision.metadata.confidence.toFixed(2)})` : "";
   const budgetWarning = lastBudgetWarningByRoute.get(routeId);
   const budgetText = budgetWarning ? ` | ⚠ ${budgetWarning}` : "";
-  return `auto-router ${getRouteName(routeId)}${tierHint} | ${active} | healthy: ${healthy.join(", ") || "none"} | ${formatCooldowns(routeId)}${budgetText}`;
+  const uviText = formatUviStatusSegment();
+  return `auto-router ${getRouteName(routeId)}${tierHint} | ${active} | healthy: ${healthy.join(", ") || "none"} | ${formatCooldowns(routeId)}${budgetText}${uviText}`;
+}
+
+function formatUviStatusSegment(): string {
+  if (!quotaCache.isEnabled()) return "";
+  const snaps = Object.values(quotaCache.getAllSnapshots());
+  const hot = snaps.filter((s) => s.status === "stressed" || s.status === "critical");
+  if (hot.length === 0) return "";
+  const parts = hot.map((s) => `${s.provider}=${s.uvi.toFixed(2)} ${s.status}`);
+  return ` | uvi: ${parts.join(", ")}`;
 }
 
 function refreshStatus(routeId?: string) {
@@ -1092,6 +1147,47 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
+      if (subcommand === "uvi") {
+        const [actionRaw] = remainder ? remainder.split(/\s+/) : [];
+        const action = String(actionRaw ?? "show").toLowerCase();
+        if (action === "enable") {
+          quotaCache.setEnabled(true);
+          ctx.ui.notify("UVI enabled. Background refresh will run on the next prompt (or use /auto-router uvi refresh).", "success");
+          return;
+        }
+        if (action === "disable") {
+          quotaCache.setEnabled(false);
+          budgetTracker.setUtilization({});
+          ctx.ui.notify("UVI disabled.", "info");
+          return;
+        }
+        if (action === "refresh") {
+          if (!quotaCache.isEnabled()) {
+            ctx.ui.notify("UVI is disabled. Enable it first with /auto-router uvi enable (or set AUTO_ROUTER_UVI=1).", "warning");
+            return;
+          }
+          ctx.ui.notify("Refreshing UVI snapshots...", "info");
+          await quotaCache.refreshNow();
+          syncUtilizationIntoBudget();
+          const lines = formatUtilizationLines(quotaCache);
+          ctx.ui.notify(lines.length > 0 ? ["UVI snapshot:", ...lines].join("\n") : "UVI: no snapshots (no OAuth providers found in auth.json?)", "info");
+          return;
+        }
+        // show (default)
+        const lines = formatUtilizationLines(quotaCache);
+        const status = quotaCache.isEnabled() ? "enabled" : "disabled";
+        const header = `UVI (${status}):`;
+        if (lines.length === 0) {
+          const hint = quotaCache.isEnabled()
+            ? "No snapshots yet. Try /auto-router uvi refresh."
+            : "Set AUTO_ROUTER_UVI=1 or run /auto-router uvi enable to start polling.";
+          ctx.ui.notify(`${header}\n  ${hint}`, "info");
+          return;
+        }
+        ctx.ui.notify([header, ...lines, "", "Subcommands: show | refresh | enable | disable"].join("\n"), "info");
+        return;
+      }
+
       if (subcommand === "budget") {
         await ensureBudgetLoaded();
         const [actionRaw, ...restArgs] = remainder ? remainder.split(/\s+/) : [];
@@ -1108,7 +1204,17 @@ export default function (pi: ExtensionAPI) {
             const ratio = typeof s.limitUsd === "number" && s.limitUsd > 0 ? ` (${Math.round((s.estimatedCost / s.limitUsd) * 100)}%)` : "";
             return `  ${s.provider.padEnd(22)} spend $${s.estimatedCost.toFixed(2)} | in ${s.inputTokens} | out ${s.outputTokens} | ${limitText}${ratio}`;
           });
-          ctx.ui.notify([`Auto-router budget for ${day}:`, ...lines, "", `Stats file: ${budgetTracker.getPath()}`].join("\n"), "info");
+          const uviLines = formatUtilizationLines(quotaCache);
+          const out = [`Auto-router budget for ${day}:`, ...lines];
+          if (uviLines.length > 0) {
+            out.push("", "UVI (utilization velocity):", ...uviLines);
+          } else if (quotaCache.isEnabled()) {
+            out.push("", "UVI: no snapshots yet (refreshing in background; try again shortly)");
+          } else {
+            out.push("", "UVI: disabled (set AUTO_ROUTER_UVI=1 to enable)");
+          }
+          out.push("", `Stats file: ${budgetTracker.getPath()}`);
+          ctx.ui.notify(out.join("\n"), "info");
           return;
         }
         if (action === "set") {
