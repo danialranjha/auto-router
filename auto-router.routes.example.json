@@ -1,4 +1,12 @@
 {
+  "_comment_policyRules": "Add a 'policyRules' array to any route to configure routing strategy. Available types: force-tier, prefer-provider, exclude-provider, force-billing, force-constraint.",
+  "_example_policyRules": [
+    { "name": "force-reasoning-for-code", "type": "force-tier", "tier": "reasoning", "priority": 1, "condition": { "intent": "code" } },
+    { "name": "prefer-claude", "type": "prefer-provider", "provider": "claude-agent-sdk", "priority": 10 },
+    { "name": "exclude-deepseek-creative", "type": "exclude-provider", "provider": "deepseek", "priority": 1, "condition": { "intent": "creative" } },
+    { "name": "per-token-for-large", "type": "force-billing", "billing": "per-token", "priority": 1, "condition": { "estimatedTokensMin": 10000 } },
+    { "name": "require-vision", "type": "force-constraint", "constraint": { "vision": true }, "priority": 1 }
+  ],
   "routes": {
     "subscription-premium": {
       "name": "Subscription Premium Router",
