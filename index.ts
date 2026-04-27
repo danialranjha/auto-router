@@ -1506,7 +1506,8 @@ export default function (pi: ExtensionAPI) {
         // show (default)
         const lines = formatUtilizationLines(quotaCache);
         const subscriptionEnabled = quotaCache.isEnabled();
-        const perTokenCount = getPerTokenProviders().length;
+        const perToken = getPerTokenProviders();
+        const perTokenCount = perToken.length;
         const statusLabel = subscriptionEnabled
           ? (perTokenCount > 0 ? "enabled (+ per-token)" : "enabled")
           : (perTokenCount > 0 ? "enabled (per-token only)" : "disabled");
@@ -1531,7 +1532,12 @@ export default function (pi: ExtensionAPI) {
           return;
         }
         const out = [header, ...lines];
-        if (balanceIssueLines.length > 0) out.push("", "⚠ per-token providers not showing:", ...balanceIssueLines);
+        if (perTokenCount === 0) {
+          out.push("", "💡 Per-token providers: none configured. Set a monthly budget to enable:");
+          out.push(`     /auto-router budget set <provider> <usd> monthly`);
+        } else if (balanceIssueLines.length > 0) {
+          out.push("", "⚠ per-token providers not showing:", ...balanceIssueLines);
+        }
         out.push("", "Subcommands: show | refresh | enable | disable");
         ctx.ui.notify(out.join("\n"), "info");
         return;
