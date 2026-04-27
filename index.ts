@@ -73,6 +73,7 @@ const latencyTracker = new LatencyTracker();
 const feedbackTracker = new FeedbackTracker();
 const balanceCache = new Map<string, BalanceState>();
 let balanceLastRefreshAt = 0;
+let balanceFetchErrors: Record<string, string> = {};
 const BALANCE_REFRESH_INTERVAL_MS = 60_000;
 
 // Shadow mode: run full pipeline but use legacy ordering for actual routing.
@@ -163,13 +164,19 @@ async function refreshBalances(): Promise<void> {
   balanceLastRefreshAt = now;
 
   const perToken = getPerTokenProviders();
+  balanceFetchErrors = {};
   if (perToken.length === 0) return;
 
   const auth = readAuth();
   const providersWithKeys = perToken
     .filter((p) => {
-      const key = p.authProvider ? auth[p.authProvider]?.access : auth[p.provider]?.access;
-      return !!key;
+      const authKey = p.authProvider ?? p.provider;
+      const entry = auth[authKey];
+      if (!entry?.access) {
+        balanceFetchErrors[p.provider] = `no API key in auth.json (checked "${authKey}")`;
+        return false;
+      }
+      return true;
     })
     .map((p) => ({
       provider: p.provider,
@@ -183,9 +190,15 @@ async function refreshBalances(): Promise<void> {
     const balances = await fetchAllBalances(providersWithKeys);
     for (const [provider, state] of Object.entries(balances)) {
       balanceCache.set(provider, state);
+      if (state.error) {
+        balanceFetchErrors[provider] = state.error;
+      }
     }
-  } catch {
-    // Best-effort; never block routing on balance fetch failures.
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    for (const { provider } of providersWithKeys) {
+      balanceFetchErrors[provider] = msg;
+    }
   }
 }
 
@@ -1384,6 +1397,8 @@ export default function (pi: ExtensionAPI) {
         getProviderHealthCache().clear();
         latencyTracker.clear();
         feedbackTracker.clear();
+        balanceCache.clear();
+        balanceFetchErrors = {};
         updateUi(ctx);
         ctx.ui.notify("Auto-router cooldowns, decision history, and health cache reset", "success");
         return;
@@ -1496,16 +1511,29 @@ export default function (pi: ExtensionAPI) {
           ? (perTokenCount > 0 ? "enabled (+ per-token)" : "enabled")
           : (perTokenCount > 0 ? "enabled (per-token only)" : "disabled");
         const header = `UVI (${statusLabel}):`;
+        // Collect per-token providers with fetch errors for diagnostics
+        const balanceIssueLines: string[] = [];
+        for (const [provider, err] of Object.entries(balanceFetchErrors)) {
+          if (!lines.some((l) => l.includes(provider))) {
+            balanceIssueLines.push(`  ${provider.padEnd(22)} [not showing: ${err}]`);
+          }
+        }
         if (lines.length === 0) {
-          const hint = subscriptionEnabled
-            ? "No snapshots yet. Try /auto-router uvi refresh."
-            : (perTokenCount > 0
-              ? "No per-token data yet. Set a monthly budget and send a prompt, then try /auto-router uvi refresh."
-              : "Set AUTO_ROUTER_UVI=1 or run /auto-router uvi enable to start polling.");
-          ctx.ui.notify(`${header}\n  ${hint}`, "info");
+          const hintParts: string[] = [];
+          if (subscriptionEnabled) hintParts.push("No OAuth snapshots yet");
+          if (perTokenCount > 0) hintParts.push("no per-token data");
+          const hint = hintParts.length > 0
+            ? `${hintParts.join("; ")}. Try /auto-router uvi refresh.`
+            : "Set AUTO_ROUTER_UVI=1 or run /auto-router uvi enable to start polling.";
+          const out = [header, `  ${hint}`];
+          if (balanceIssueLines.length > 0) out.push(...balanceIssueLines);
+          ctx.ui.notify(out.join("\n"), "info");
           return;
         }
-        ctx.ui.notify([header, ...lines, "", "Subcommands: show | refresh | enable | disable"].join("\n"), "info");
+        const out = [header, ...lines];
+        if (balanceIssueLines.length > 0) out.push("", "⚠ per-token providers not showing:", ...balanceIssueLines);
+        out.push("", "Subcommands: show | refresh | enable | disable");
+        ctx.ui.notify(out.join("\n"), "info");
         return;
       }
 
@@ -1520,7 +1548,7 @@ export default function (pi: ExtensionAPI) {
         // show (default)
         const perToken = getPerTokenProviders();
         if (perToken.length === 0) {
-          ctx.ui.notify("No per-token providers configured. Add `\"billing\": \"per-token\"` to a route target.", "info");
+          ctx.ui.notify("No per-token providers configured. Add `\"billing\": \"per-token\"` to a route target, or set a monthly budget.", "info");
           return;
         }
         const lines: string[] = [];
@@ -1530,12 +1558,13 @@ export default function (pi: ExtensionAPI) {
           const monthlySpend = budgetTracker.getMonthlySpend()[provider] ?? 0;
           const limitText = monthlyLimit ? `$${monthlyLimit.toFixed(2)}` : "none";
           const pctText = monthlyLimit ? ` (${Math.round((monthlySpend / monthlyLimit) * 100)}% used)` : "";
+          const errText = balanceFetchErrors[provider] ? ` [! ${balanceFetchErrors[provider]}]` : "";
           if (balance && !balance.error) {
             lines.push(`  ${provider.padEnd(22)} balance $${balance.totalBalance.toFixed(2)} ${balance.currency} | topped-up $${balance.toppedUpBalance.toFixed(2)} | budget ${limitText} | spent $${monthlySpend.toFixed(2)}${pctText}`);
           } else if (balance?.error) {
             lines.push(`  ${provider.padEnd(22)} [fetch error: ${balance.error}] | budget ${limitText} | spent $${monthlySpend.toFixed(2)}${pctText}`);
           } else {
-            lines.push(`  ${provider.padEnd(22)} [not fetched yet] | budget ${limitText} | spent $${monthlySpend.toFixed(2)}${pctText}`);
+            lines.push(`  ${provider.padEnd(22)} [not fetched yet${errText}] | budget ${limitText} | spent $${monthlySpend.toFixed(2)}${pctText}`);
           }
         }
         const uviLines = (() => {
