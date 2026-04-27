@@ -175,6 +175,7 @@ Skip it for providers that authenticate internally or don’t require pi-managed
 - `/auto-router budget [show|set <provider> <usd> [monthly]|clear <provider> [monthly]]` — view/manage daily/monthly per-provider budgets
 - `/auto-router uvi [show|enable|disable|refresh]` — view/manage Utilization Velocity Index monitoring
 - `/auto-router shadow [show|enable|disable]` — run pipeline in shadow mode (log but don't change routing)
+- `/auto-router rules` — show active policy rules and last applied strategy hints
 - `/auto-router reload`
 - `/auto-router reset` — clears cooldowns, decision history, and budget warnings
 
