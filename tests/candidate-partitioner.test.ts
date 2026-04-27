@@ -123,4 +123,55 @@ describe("partitionAuditedCandidates", () => {
     assert.deepEqual(result.promoted, [a, b]);
     assert.deepEqual(result.normal, [c]);
   });
+
+  it("hard mode: excludes demoted candidates from ordered list", () => {
+    const a = target("openai-codex", "A");
+    const b = target("claude-agent-sdk", "B");
+    const c = target("google-gemini-cli", "C");
+    const budgetState: BudgetState = {
+      dailySpend: {},
+      dailyLimit: {},
+      utilization: {
+        "openai-codex": snap("openai-codex", "stressed", 1.7),
+        "google-gemini-cli": snap("google-gemini-cli", "surplus", 0.3),
+      },
+    };
+    const result = partitionAuditedCandidates([a, b, c], budgetState, { hardMode: true });
+    // Demoted (A) excluded; only promoted + normal in ordered
+    assert.deepEqual(result.ordered, [c, b]);
+    assert.deepEqual(result.promoted, [c]);
+    assert.deepEqual(result.normal, [b]);
+    assert.deepEqual(result.demoted, [a]); // still tracked, just not in ordered
+  });
+
+  it("hard mode: demoted are still tracked in uviNotes and demoted array", () => {
+    const a = target("openai-codex", "A");
+    const budgetState: BudgetState = {
+      dailySpend: {},
+      dailyLimit: {},
+      utilization: { "openai-codex": snap("openai-codex", "stressed", 1.8) },
+    };
+    const result = partitionAuditedCandidates([a], budgetState, { hardMode: true });
+    assert.deepEqual(result.ordered, []);
+    assert.equal(result.demoted.length, 1);
+    assert.equal(result.uviNotes.length, 1);
+    assert.ok(result.uviNotes[0].includes("demoted"));
+  });
+
+  it("hard mode false: demoted are included in ordered (backward compat)", () => {
+    const a = target("openai-codex", "A");
+    const b = target("claude-agent-sdk", "B");
+    const c = target("google-gemini-cli", "C");
+    const budgetState: BudgetState = {
+      dailySpend: {},
+      dailyLimit: {},
+      utilization: {
+        "openai-codex": snap("openai-codex", "stressed", 1.7),
+        "google-gemini-cli": snap("google-gemini-cli", "surplus", 0.3),
+      },
+    };
+    const result = partitionAuditedCandidates([a, b, c], budgetState, { hardMode: false });
+    // Same as default: [promoted, normal, demoted]
+    assert.deepEqual(result.ordered, [c, b, a]);
+  });
 });

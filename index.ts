@@ -67,6 +67,13 @@ const quotaCache = new QuotaCache();
 let shadowMode = envShadowEnabled();
 const lastShadowByRoute = new Map<string, { shadowTargets: string[]; actualTargets: string[] }>();
 
+// UVI hard mode: when enabled, demoted (stressed) providers are completely excluded
+// rather than just deprioritized. AUTO_ROUTER_UVI_HARD=1
+const uviHardMode = (() => {
+  const raw = process.env.AUTO_ROUTER_UVI_HARD;
+  return raw === "1" || (raw ?? "").toLowerCase() === "true" || (raw ?? "").toLowerCase() === "on";
+})();
+
 let budgetReady = false;
 let latestUiContext: any;
 
@@ -794,7 +801,7 @@ function streamAutoRouter(model: Model<Api>, context: Context, options?: SimpleS
         isHealthy: (t) => healthCache.isHealthy(t.provider, t.authProvider),
       });
 
-      const partition = partitionAuditedCandidates(solved.candidates, budgetState);
+      const partition = partitionAuditedCandidates(solved.candidates, budgetState, { hardMode: uviHardMode });
       const auditedRejections = partition.rejections;
       const budgetWarnings = partition.warnings;
       const uviNotes = partition.uviNotes;
@@ -939,7 +946,8 @@ function getStatusLine(routeId?: string): string {
   const uviText = formatUviStatusSegment();
   const healthIssuesText = formatHealthIssuesSegment(healthy);
   const shadowText = shadowMode ? " 🔬 shadow" : "";
-  return `auto-router ${getRouteName(routeId)}${tierHint}${shadowText} | ${active} | healthy: ${healthy.join(", ") || "none"} | ${formatCooldowns(routeId)}${budgetText}${healthIssuesText}${uviText}`;
+  const hardText = uviHardMode && quotaCache.isEnabled() ? " 🛡️ uvi-hard" : "";
+  return `auto-router ${getRouteName(routeId)}${tierHint}${shadowText}${hardText} | ${active} | healthy: ${healthy.join(", ") || "none"} | ${formatCooldowns(routeId)}${budgetText}${healthIssuesText}${uviText}`;
 }
 
 function formatUviStatusSegment(): string {

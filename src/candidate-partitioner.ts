@@ -15,7 +15,9 @@ export type PartitionResult = {
 export function partitionAuditedCandidates(
   candidates: RouteTarget[],
   budgetState: BudgetState | undefined,
+  opts?: { hardMode?: boolean },
 ): PartitionResult {
+  const hardMode = opts?.hardMode ?? false;
   const promoted: RouteTarget[] = [];
   const normal: RouteTarget[] = [];
   const demoted: RouteTarget[] = [];
@@ -46,7 +48,7 @@ export function partitionAuditedCandidates(
   }
 
   return {
-    ordered: [...promoted, ...normal, ...demoted],
+    ordered: hardMode ? [...promoted, ...normal] : [...promoted, ...normal, ...demoted],
     promoted,
     normal,
     demoted,

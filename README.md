@@ -313,6 +313,16 @@ When a provider’s UVI is `stressed` or `critical`, it also appears in the stat
 
 _Note: UVI requires valid OAuth tokens in `~/.pi/agent/auth.json`. If a token is expired and can't be refreshed, that provider shows an error in `uvi show`._
 
+### UVI Hard Mode
+
+By default, UVI uses a **tiebreaker** strategy: stressed providers are deprioritized but still tried if all other candidates fail. Enable hard mode to **completely exclude** stressed providers:
+
+```bash
+AUTO_ROUTER_UVI_HARD=1
+```
+
+When active, the status line shows `🛡️ uvi-hard`. Demoted providers will not be tried at all — useful when you want strict quota protection near exhaustion. Surplus promotions still use tiebreaker ordering (promoted first, normal as fallback).
+
 ## Shadow mode
 
 Shadow mode runs the full routing pipeline (shortcut parsing, context analysis, constraint solving, budget auditing, UVI reordering) but uses **legacy config-order targets** for actual routing. This lets you validate new routing logic without affecting your experience.

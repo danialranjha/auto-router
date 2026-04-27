@@ -14,7 +14,7 @@ New modules: `src/uvi.ts`, `src/quota-fetcher.ts`, `src/quota-cache.ts`, `src/ca
 
 | # | Item | Status |
 |---|------|--------|
-| 1 | **Hard-override env flag** for surplus promotion | ⬜ Currently tiebreaker-only; `AUTO_ROUTER_UVI_SURPLUS_HARD=1` would let surplus override normal priority entirely |
+| 1 | **Hard-override env flag** for surplus promotion | ✅ `AUTO_ROUTER_UVI_HARD=1` excludes demoted (stressed) providers entirely; `🛡️ uvi-hard` in status line |
 | 2 | **Default-on for UVI** | ⬜ Currently opt-in behind `AUTO_ROUTER_UVI=1`; flip once real-world validated |
 | 3 | Remaining Phase 7 bullets from PROPOSAL | ⬜ Performance ranking, intent classification, health checks, feedback loop — see PROPOSAL.md |
 
